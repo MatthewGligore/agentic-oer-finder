@@ -1,0 +1,34 @@
+@import "tailwindcss";
+@custom-variant dark (&:where(.dark, .dark *));
+
+@theme {
+  --font-sans: Inter, system-ui, -apple-system, Segoe UI, Roboto, sans-serif;
+
+  --color-brand-50: #eff6ff;
+  --color-brand-100: #dbeafe;
+  --color-brand-500: #3b82f6;
+  --color-brand-600: #2563eb;
+  --color-brand-700: #1d4ed8;
+
+  --color-app-100: #f1f5f9;
+  --color-app-200: #e2e8f0;
+  --color-surface: #ffffff;
+}
+
+@layer base {
+  html,
+  body,
+  #root {
+    min-height: 100%;
+  }
+
+  body {
+    @apply font-sans antialiased;
+  }
+
+  .dark {
+    --color-app-100: #0f172a;
+    --color-app-200: #020617;
+    --color-surface: #0b1220;
+  }
+}
