@@ -4,26 +4,11 @@ Command Line Interface for Agentic OER Finder
 import argparse
 import json
 import sys
-from oer_agent import OERAgent
-from config import Config
+from .oer_agent import OERAgent
+from .config import Config
 
-def main():
-    parser = argparse.ArgumentParser(description='Agentic OER Finder - Find Open Educational Resources')
-    parser.add_argument('--course', '-c', type=str, required=True,
-                       help='Course code (e.g., ENGL 1101)')
-    parser.add_argument('--term', '-t', type=str, default=None,
-                       help='Term (e.g., Fall 2025)')
-    parser.add_argument('--output', '-o', type=str, default=None,
-                       help='Output file path (JSON format)')
-    parser.add_argument('--llm-provider', type=str, default=None,
-                       help='LLM provider (openai, anthropic)')
-    parser.add_argument('--llm-model', type=str, default=None,
-                       help='LLM model name')
-    parser.add_argument('--verbose', '-v', action='store_true',
-                       help='Verbose output')
-    
-    args = parser.parse_args()
-    
+def search_command(args):
+    """Handle search command"""
     # Initialize agent
     agent = OERAgent(llm_provider=args.llm_provider, llm_model=args.llm_model)
     
@@ -93,6 +78,74 @@ def main():
         print(f"\nResults saved to {args.output}")
     
     print("\n" + "=" * 80)
+
+
+def scrape_syllabuses_command(args):
+    """Handle scrape-syllabuses command"""
+    from .scrapers.bulk_scraper import BulkScraper
+    
+    print("Starting bulk syllabus scraper...")
+    print(f"Limit: {args.limit if args.limit else 'All syllabuses'}")
+    print(f"Skip existing: {args.skip_existing}")
+    print()
+    
+    try:
+        scraper = BulkScraper()
+        scraper.run(
+            limit=args.limit,
+            skip_existing=args.skip_existing,
+            batch_size=args.batch_size
+        )
+    except Exception as e:
+        print(f"Error: {e}", file=sys.stderr)
+        sys.exit(1)
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description='Agentic OER Finder - Find Open Educational Resources'
+    )
+    
+    # Create subparsers for different commands
+    subparsers = parser.add_subparsers(dest='command', help='Commands')
+    
+    # Search command
+    search_parser = subparsers.add_parser('search', help='Search for OER resources')
+    search_parser.add_argument('--course', '-c', type=str, required=True,
+                              help='Course code (e.g., ENGL 1101)')
+    search_parser.add_argument('--term', '-t', type=str, default=None,
+                              help='Term (e.g., Fall 2025)')
+    search_parser.add_argument('--output', '-o', type=str, default=None,
+                              help='Output file path (JSON format)')
+    search_parser.add_argument('--llm-provider', type=str, default=None,
+                              help='LLM provider (openai, anthropic)')
+    search_parser.add_argument('--llm-model', type=str, default=None,
+                              help='LLM model name')
+    search_parser.add_argument('--verbose', '-v', action='store_true',
+                              help='Verbose output')
+    search_parser.set_defaults(func=search_command)
+    
+    # Scrape syllabuses command
+    scrape_parser = subparsers.add_parser('scrape-syllabuses', help='Bulk scrape SimpleSyllabus library')
+    scrape_parser.add_argument('--limit', type=int, default=None,
+                              help='Maximum number of syllabuses to scrape (default: all)')
+    scrape_parser.add_argument('--skip-existing', dest='skip_existing', action='store_true',
+                              default=True, help='Skip syllabuses already in database (default: True)')
+    scrape_parser.add_argument('--no-skip', dest='skip_existing', action='store_false',
+                              help='Do NOT skip existing syllabuses (re-scrape all)')
+    scrape_parser.add_argument('--batch-size', type=int, default=100,
+                              help='Batch size for database inserts (default: 100)')
+    scrape_parser.set_defaults(func=scrape_syllabuses_command)
+    
+    args = parser.parse_args()
+    
+    # If no command specified, show help
+    if args.command is None:
+        parser.print_help()
+        sys.exit(0)
+    
+    # Execute the appropriate command function
+    args.func(args)
 
 if __name__ == '__main__':
     main()

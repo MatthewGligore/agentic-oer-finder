@@ -27,6 +27,21 @@ const oerAPI = {
       }
     }
   },
+
+  scrapeSyllabi: async (courseCode, term = '', limit = 0) => {
+    try {
+      const response = await axios.post(`${API_BASE}/scrape-syllabi`, {
+        course_code: courseCode,
+        term,
+        limit,
+      })
+      return response.data
+    } catch (error) {
+      throw error.response?.data || {
+        error: 'Failed to scrape syllabi'
+      }
+    }
+  },
 }
 
 export default oerAPI

@@ -14,7 +14,7 @@ class Config:
     OPENAI_API_KEY = os.getenv('OPENAI_API_KEY', '')
     ANTHROPIC_API_KEY = os.getenv('ANTHROPIC_API_KEY', '')
     # If no API keys provided, system uses no-API mode automatically
-    DEFAULT_LLM_PROVIDER = os.getenv('DEFAULT_LLM_PROVIDER', 'openai')
+    DEFAULT_LLM_PROVIDER = os.getenv('DEFAULT_LLM_PROVIDER', 'no_api').strip().lower()
     env_model = os.getenv('DEFAULT_MODEL', 'gpt-4o')
     if env_model in ['gpt-4-turbo-preview', 'gpt-4-turbo']:
         DEFAULT_MODEL = 'gpt-4o'
@@ -33,16 +33,19 @@ class Config:
     DEBUG = os.getenv('DEBUG', 'False').lower() == 'true'
     PORT = int(os.getenv('PORT', 8000))
     
+    # Supabase Configuration
+    SUPABASE_URL = os.getenv('SUPABASE_URL', '')
+    SUPABASE_ANON_KEY = os.getenv('SUPABASE_ANON_KEY', '')
+    SUPABASE_SERVICE_ROLE_KEY = os.getenv('SUPABASE_SERVICE_ROLE_KEY', '')
+    USE_SUPABASE = bool(SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY)
+    
     # Required Courses for Testing
     REQUIRED_COURSES = [
-        'ARTS 1100',
         'ENGL 1101',
-        'ENGL 1102',
-        'HIST 2111',
-        'HIST 2112',
         'ITEC 1001',
-        'BIOL 1101K',
-        'BIOL 1102'
+        'ITEC 2150',
+        'ENGL 1102',
+        'ITEC 3150'
     ]
     
     # OER Quality Rubric Criteria

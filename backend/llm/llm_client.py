@@ -3,8 +3,10 @@ LLM Client for OER identification and evaluation
 Supports multiple LLM providers: OpenAI, Anthropic, etc.
 """
 import os
+import time
 from typing import List, Dict, Optional
 import logging
+import requests
 
 logger = logging.getLogger(__name__)
 
@@ -15,12 +17,35 @@ class LLMClient:
         self.provider = provider.lower()
         self.model = model or self._get_default_model()
         self.client = self._initialize_client()
+
+    @staticmethod
+    def _is_usable_api_key(key: str) -> bool:
+        """Return True only for non-placeholder keys.
+
+        This prevents accidental calls with template/example keys.
+        """
+        if not key:
+            return False
+
+        normalized = key.strip().lower()
+        placeholder_patterns = [
+            'your_openai',
+            'your_anthropic',
+            'replace_me',
+            'changeme',
+            'placeholder',
+            'example',
+            'none',
+            'null'
+        ]
+        return not any(pattern in normalized for pattern in placeholder_patterns)
     
     def _get_default_model(self) -> str:
         """Get default model for provider"""
         defaults = {
             'openai': 'gpt-4o',
             'anthropic': 'claude-3-5-sonnet-20241022',
+            'ollama': 'llama3.2:3b',
             'openai-gpt4': 'gpt-4o',
             'openai-gpt3': 'gpt-3.5-turbo'
         }
@@ -29,18 +54,31 @@ class LLMClient:
     def _initialize_client(self):
         """Initialize the appropriate LLM client"""
         # Check if we should use no-API mode
-        api_key = os.getenv('OPENAI_API_KEY', '')
-        anthropic_key = os.getenv('ANTHROPIC_API_KEY', '')
+        api_key = os.getenv('OPENAI_API_KEY', '').strip()
+        anthropic_key = os.getenv('ANTHROPIC_API_KEY', '').strip()
+
+        # Explicit no-api providers always bypass external API clients.
+        if self.provider in {'no_api', 'no-api', 'builtin', 'local'}:
+            logger.info("No-API provider selected. Using fallback suggestions only.")
+            return 'no-api'
+
+        # Local Ollama provider does not require cloud API keys.
+        if self.provider == 'ollama':
+            logger.info("Using local Ollama provider.")
+            return 'ollama'
+
+        api_key_usable = self._is_usable_api_key(api_key)
+        anthropic_key_usable = self._is_usable_api_key(anthropic_key)
         
         # If no API keys provided, use no-API mode
-        if not api_key and not anthropic_key:
+        if not api_key_usable and not anthropic_key_usable:
             logger.info("No API keys found. Using no-API mode (fallback suggestions only).")
             return 'no-api'  # Special marker for no-API mode
         
         if self.provider == 'openai' or self.provider.startswith('openai'):
             try:
                 from openai import OpenAI
-                if not api_key:
+                if not api_key_usable:
                     logger.warning("OPENAI_API_KEY not found. Using no-API mode.")
                     return 'no-api'
                 return OpenAI(api_key=api_key)
@@ -54,7 +92,7 @@ class LLMClient:
         elif self.provider == 'anthropic':
             try:
                 import anthropic
-                if not anthropic_key:
+                if not anthropic_key_usable:
                     logger.warning("ANTHROPIC_API_KEY not found. Using no-API mode.")
                     return 'no-api'
                 return anthropic.Anthropic(api_key=anthropic_key)
@@ -91,6 +129,31 @@ class LLMClient:
             return None
         
         try:
+            if self.client == 'ollama':
+                base_url = os.getenv('OLLAMA_BASE_URL', 'http://localhost:11434').rstrip('/')
+                timeout_seconds = int(os.getenv('OLLAMA_TIMEOUT_SECONDS', '45'))
+                payload = {
+                    "model": self.model,
+                    "stream": False,
+                    "messages": []
+                }
+
+                if system_prompt:
+                    payload["messages"].append({"role": "system", "content": system_prompt})
+                payload["messages"].append({"role": "user", "content": prompt})
+
+                started = time.time()
+                logger.info("Ollama generate start: model=%s timeout=%ss", self.model, timeout_seconds)
+                response = requests.post(
+                    f"{base_url}/api/chat",
+                    json=payload,
+                    timeout=timeout_seconds
+                )
+                response.raise_for_status()
+                data = response.json()
+                logger.info("Ollama generate complete in %.2fs", time.time() - started)
+                return (data.get('message') or {}).get('content')
+
             if self.provider == 'openai' or self.provider.startswith('openai'):
                 if not self.client:
                     logger.error("OpenAI client not initialized")
@@ -205,7 +268,7 @@ Format your response as a structured list."""
             return self._parse_oer_identification(response, alg_resources)
         return []
     
-    def evaluate_oer_quality(self, resource: Dict, rubric_criteria: List[str]) -> Dict:
+    def evaluate_oer_quality(self, resource: Dict, rubric_criteria: List[str], syllabus_info: Dict = None) -> Dict:
         """
         Evaluate an OER resource using the quality rubric
         
@@ -225,7 +288,24 @@ Format your response as a structured list."""
 Evaluate resources using the OER quality rubric criteria.
 Provide scores (1-5 scale) and detailed explanations for each criterion."""
         
+        syllabus_context = ''
+        if syllabus_info:
+            sections = syllabus_info.get('sections') or {}
+            section_lines = []
+            for section_name, content in list(sections.items())[:5]:
+                section_lines.append(f"- {section_name}: {str(content)[:240]}")
+            syllabus_context = f"""
+Syllabus Context:
+Course: {syllabus_info.get('course_code', 'N/A')}
+Course Title: {syllabus_info.get('course_title') or syllabus_info.get('title', 'N/A')}
+Description: {str(syllabus_info.get('description', ''))[:400]}
+Key Sections:
+{chr(10).join(section_lines) if section_lines else '- No parsed sections available.'}
+"""
+
         prompt = f"""Evaluate this OER resource using the quality rubric:
+
+{syllabus_context}
 
 Resource Information:
 Title: {resource.get('title', 'N/A')}
@@ -240,7 +320,7 @@ Rubric Criteria to Evaluate:
 For each criterion, provide:
 1. Score (1-5, where 5 is excellent)
 2. Detailed explanation
-3. Evidence from the resource information
+3. Evidence from both the resource information and syllabus context
 
 Also provide:
 - Overall quality score

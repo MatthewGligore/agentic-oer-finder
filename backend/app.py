@@ -7,8 +7,12 @@ from flask_cors import CORS
 import logging
 import os
 import sys
+from datetime import datetime, timezone
 from .oer_agent import OERAgent
 from .config import Config
+from .scrapers.library_index_scraper import fetch_library_index
+from .scrapers.syllabus_content_scraper import fetch_and_parse_syllabus, prepare_section_records
+from .llm.supabase_client import get_supabase_client
 
 app = Flask(__name__)
 app.config.from_object(Config)
@@ -54,6 +58,10 @@ def search_oer():
         
         oer_agent = get_agent()
         results = oer_agent.find_oer_for_course(course_code, term)
+
+        if results.get('course_not_found'):
+            logger.info(f"Course not found after scraping: {course_code}")
+            return jsonify(results), 404
         
         # Debug logging
         evaluated_count = len(results.get('evaluated_resources', []))
@@ -68,57 +76,6 @@ def search_oer():
         elif not isinstance(results['evaluated_resources'], list):
             logger.warning(f"evaluated_resources is not a list! Type: {type(results['evaluated_resources'])}")
             results['evaluated_resources'] = []
-        
-        # CRITICAL: If we have resources_found but no evaluated_resources, something went wrong
-        if resources_found > 0 and evaluated_count == 0:
-            logger.error(f"PROBLEM: Found {resources_found} resources but 0 evaluated! Creating emergency fallback.")
-            # Try to get default suggestions as emergency fallback
-            try:
-                default_resources = oer_agent._get_default_suggestions(course_code)
-                logger.info(f"Using {len(default_resources)} default suggestions as emergency fallback")
-                # Quick evaluation
-                for resource in default_resources[:5]:
-                    try:
-                        rubric_eval = oer_agent.rubric_evaluator.evaluate(resource, {})
-                        license_check = oer_agent.license_checker.check_license(resource)
-                        results['evaluated_resources'].append({
-                            'resource': resource,
-                            'relevance_explanation': f'Emergency fallback resource for {course_code}',
-                            'llm_evaluation': {},
-                            'rubric_evaluation': rubric_eval,
-                            'license_check': license_check,
-                            'integration_guidance': oer_agent._generate_integration_guidance(resource, rubric_eval, license_check)
-                        })
-                    except Exception as e:
-                        logger.error(f"Error in emergency fallback evaluation: {e}")
-                evaluated_count = len(results['evaluated_resources'])
-                logger.info(f"Emergency fallback created {evaluated_count} resources")
-            except Exception as e:
-                logger.error(f"Emergency fallback also failed: {e}", exc_info=True)
-        
-        # FINAL GUARANTEE: Always ensure we have at least some resources
-        if len(results.get('evaluated_resources', [])) == 0:
-            logger.warning("FINAL FALLBACK: No resources at all. Creating default suggestions.")
-            try:
-                default_resources = oer_agent._get_default_suggestions(course_code)
-                for resource in default_resources[:3]:
-                    try:
-                        rubric_eval = oer_agent.rubric_evaluator.evaluate(resource, {})
-                        license_check = oer_agent.license_checker.check_license(resource)
-                        results['evaluated_resources'].append({
-                            'resource': resource,
-                            'relevance_explanation': f'Default OER suggestion for {course_code}',
-                            'llm_evaluation': {},
-                            'rubric_evaluation': rubric_eval,
-                            'license_check': license_check,
-                            'integration_guidance': oer_agent._generate_integration_guidance(resource, rubric_eval, license_check)
-                        })
-                    except:
-                        pass
-                evaluated_count = len(results['evaluated_resources'])
-                logger.info(f"Final fallback created {evaluated_count} resources")
-            except Exception as e:
-                logger.error(f"Final fallback failed: {e}")
         
         # Verify we can serialize
         try:
@@ -177,6 +134,107 @@ def get_stats():
         return jsonify(stats)
     except Exception as e:
         logger.error(f"Error getting stats: {e}", exc_info=True)
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/scrape-syllabi', methods=['POST'])
+def scrape_syllabi_for_course():
+    """Scrape syllabus library for a specific course code and store missing rows in Supabase."""
+    try:
+        data = request.get_json() or {}
+        course_code = data.get('course_code', '').strip().upper()
+        term = data.get('term', '').strip()
+        limit = int(data.get('limit') or 0)
+
+        if not course_code:
+            return jsonify({'error': 'Course code is required'}), 400
+
+        sb = get_supabase_client()
+        if not sb.is_available():
+            return jsonify({'error': 'Supabase is not configured or unavailable'}), 500
+
+        logger.info(f"Syllabus scrape request: course={course_code}, term={term or 'any'}")
+        discovered = fetch_library_index()
+
+        def norm_term(value: str) -> str:
+            return (value or '').lower().replace(' ', '').replace('_', '-').replace('--', '-')
+
+        matches = [row for row in discovered if row.get('course_code') == course_code]
+        if term:
+            target_term = norm_term(term)
+            matches = [row for row in matches if target_term in norm_term(row.get('term', ''))]
+
+        if not matches:
+            return jsonify({
+                'course_code': course_code,
+                'term': term,
+                'course_not_found': True,
+                'error': f'No syllabi found for {course_code} in the syllabus library.',
+                'discovered_count': len(discovered),
+                'matched_count': 0,
+                'inserted_syllabuses': 0,
+                'inserted_sections': 0,
+                'skipped_existing': 0,
+                'failed': 0,
+            }), 404
+
+        if limit > 0:
+            matches = matches[:limit]
+
+        inserted_syllabuses = 0
+        inserted_sections = 0
+        skipped_existing = 0
+        failed = 0
+
+        for item in matches:
+            url = item.get('syllabus_url', '')
+            if not url:
+                failed += 1
+                continue
+
+            if sb.fetch_syllabus_by_url(url):
+                skipped_existing += 1
+                continue
+
+            record = {
+                'course_code': item.get('course_code', course_code),
+                'course_title': item.get('card_title') or item.get('course_title') or item.get('course_code') or course_code,
+                'term': item.get('term'),
+                'section_number': item.get('section_number'),
+                'course_id': item.get('course_id'),
+                'instructor_name': item.get('instructor_name'),
+                'syllabus_url': url,
+                'scraped_at': datetime.now(timezone.utc).isoformat(),
+            }
+
+            inserted = sb.insert_syllabus(record)
+            if not inserted:
+                failed += 1
+                continue
+
+            sections = fetch_and_parse_syllabus(url)
+            payload = prepare_section_records(inserted['id'], sections)
+            if payload:
+                inserted_sections += sb.insert_sections_batch(payload)
+
+            inserted_syllabuses += 1
+
+        final_db_rows = sb.fetch_syllabuses_by_course_code(course_code, term or None)
+        return jsonify({
+            'course_code': course_code,
+            'term': term,
+            'discovered_count': len(discovered),
+            'matched_count': len(matches),
+            'inserted_syllabuses': inserted_syllabuses,
+            'inserted_sections': inserted_sections,
+            'skipped_existing': skipped_existing,
+            'failed': failed,
+            'db_total_for_course': len(final_db_rows),
+            'message': f'Finished scraping {course_code}. Inserted {inserted_syllabuses} syllabi and {inserted_sections} sections.'
+        }), 200
+
+    except Exception as e:
+        logger.error(f"Error scraping syllabi: {e}", exc_info=True)
         return jsonify({'error': str(e)}), 500
 
 @app.route('/api/courses', methods=['GET'])

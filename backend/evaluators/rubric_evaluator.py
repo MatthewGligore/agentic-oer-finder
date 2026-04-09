@@ -89,6 +89,14 @@ class RubricEvaluator:
             eval_data.update(self._evaluate_pedagogical_value(resource))
         elif criterion == 'Technical Quality':
             eval_data.update(self._evaluate_technical_quality(resource))
+
+        # Always provide direct click-through evidence for UI rendering.
+        resource_url = resource.get('url', '')
+        search_url = resource.get('source_search_url', '')
+        if resource_url:
+            eval_data['evidence'].append({'label': 'Resource page', 'url': resource_url})
+        if search_url and search_url != resource_url:
+            eval_data['evidence'].append({'label': 'Source search', 'url': search_url})
         
         return eval_data
     

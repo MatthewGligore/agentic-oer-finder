@@ -122,10 +122,11 @@ Configuration is managed through `config.py` and environment variables.
 
 ```
 # LLM Configuration
-DEFAULT_LLM_PROVIDER=openai  # or 'anthropic' or 'no_api'
+DEFAULT_LLM_PROVIDER=openai  # or 'anthropic' or 'ollama' or 'no_api'
 DEFAULT_MODEL=gpt-4o
 OPENAI_API_KEY=your_key_here
 ANTHROPIC_API_KEY=your_key_here
+OLLAMA_BASE_URL=http://localhost:11434
 
 # Scraper Configuration
 SYLLABUS_BASE_URL=https://ggc.simplesyllabus.com
