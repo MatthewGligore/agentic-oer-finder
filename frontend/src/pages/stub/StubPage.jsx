@@ -3,16 +3,12 @@ import React from 'react'
 function StubPage({ title, description, icon }) {
   return (
     <main className="canvas with-side-nav">
-      <section style={{ textAlign: 'center', padding: '3rem 1rem' }}>
-        <div style={{ fontSize: '3rem', marginBottom: '1rem', opacity: 0.5 }}>
-          <span className="material-symbols-outlined" style={{ fontSize: 'inherit' }}>
-            {icon}
-          </span>
+      <section className="panel empty-state-card">
+        <div className="empty-state-icon">
+          <span className="material-symbols-outlined">{icon}</span>
         </div>
-        <h1 style={{ marginBottom: '0.5rem', color: 'var(--primary)' }}>{title}</h1>
-        <p style={{ color: 'var(--muted)', maxWidth: '500px', margin: '0 auto' }}>
-          {description}
-        </p>
+        <h1>{title}</h1>
+        <p>{description}</p>
       </section>
     </main>
   )
