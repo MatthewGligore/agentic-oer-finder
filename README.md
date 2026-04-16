@@ -1,309 +1,126 @@
 # Agentic OER Finder
 
-A modern, AI-powered Open Educational Resources (OER) finder that helps educators discover and evaluate high-quality educational materials for their courses.
+Agentic OER Finder helps faculty discover open educational resources by course code, then ranks results with rubric and license checks.
 
-## Project Structure
+## Documentation Index
 
-```
-agentic-oer-finder/
-├── backend/                       # Python Flask backend
-│   ├── app.py                    # Flask application (API server)
-│   ├── oer_agent.py              # Main OER search logic
-│   ├── config.py                 # Configuration
-│   ├── requirements.txt          # Python dependencies
-│   ├── evaluators/               # Resource evaluators
-│   ├── scrapers/                 # Web scrapers
-│   ├── llm/                      # LLM integration
-│   ├── utils/                    # Utilities
-│   ├── logs/                     # Application logs
-│   ├── static/                   # Legacy static assets
-│   ├── test_simple.py            # Simple tests
-│   └── test_courses.py           # Course-based tests
-├── frontend/                      # React + Vite frontend
-│   ├── src/
-│   │   ├── components/           # React components
-│   │   ├── services/             # API service layer
-│   │   ├── App.jsx               # Main App component
-│   │   └── main.jsx              # Entry point
-│   ├── package.json
-│   ├── vite.config.js
-│   ├── index.html
-│   └── README.md
-├── .env                          # Environment variables (copy from .env.example)
-├── .env.example                  # Environment template
-├── .gitignore
-├── setup.sh                      # Setup script (Mac/Linux)
-├── setup.bat                     # Setup script (Windows)
-└── README.md
-```
+| Doc | Purpose |
+|---|---|
+| [README.md](README.md) | Main quick start and project overview |
+| [ARCHITECTURE.md](ARCHITECTURE.md) | System design and runtime flow |
+| [DEMO_CHECKLIST.md](DEMO_CHECKLIST.md) | Live demo prep and fallback steps |
+| [DEPLOYMENT.md](DEPLOYMENT.md) | Local and hosted deployment patterns |
+| [SUPABASE_SETUP.md](SUPABASE_SETUP.md) | Optional Supabase setup and seeding |
+| [backend/README.md](backend/README.md) | Backend API and CLI guide |
+| [frontend/README.md](frontend/README.md) | Frontend run/build guide |
+| [docs/archive/README.md](docs/archive/README.md) | Archived planning and phase docs |
 
-## Features
+## Polished Demo State
 
-- **No API Key Required**: Uses built-in suggestions and web scraping instead of external APIs
-- **Course-based Search**: Find OER resources by course code
-- **Quality Evaluation**: Automatic scoring of resources using rubric-based evaluation
-- **License Checking**: Identifies open licenses and permissions
-- **Modern React UI**: Built with React and Vite for fast, responsive experience
-- **REST API Backend**: Flask API server for backend operations
-- **Integration Guidance**: Provides tips for integrating resources into courses
+- Frontend: React + Vite on `http://localhost:3000`
+- Backend: Flask API on `http://localhost:8000`
+- Default mode: `no_api` (works without OpenAI/Anthropic keys)
+- Optional: Supabase-backed syllabus context for stronger relevance
 
 ## Quick Start
 
 ### Prerequisites
 
-- Node.js 16+ (for frontend)
-- Python 3.10–3.13 recommended (for backend)
+- Node.js 18+
+- Python 3.10-3.13 (recommended)
 
-Python 3.14 may have compatibility issues with native dependencies in some environments.
+### 1) Install Dependencies
 
-### Automated Setup (Recommended)
-
-**Mac/Linux:**
 ```bash
-chmod +x setup.sh
-./setup.sh
-```
-
-**Windows:**
-```bash
-setup.bat
-```
-
-### Manual Setup
-
-**Backend:**
-```bash
-python3 -m venv venv
-source venv/bin/activate  # On Windows: venv\Scripts\activate
+# from repo root
+python3 -m venv .venv
+source .venv/bin/activate
 pip install -r backend/requirements.txt
-```
 
-**Frontend:**
-```bash
 cd frontend
 npm install
+cd ..
 ```
 
-## Running the Application
+### 2) Configure Environment
 
-### Development Mode
-
-**Terminal 1 - Start Backend (API server on port 8000):**
 ```bash
-source venv/bin/activate  # On Windows: venv\Scripts\activate
+cp .env.example .env
+```
+
+The app runs in local `no_api` mode by default. Supabase is optional.
+
+### 3) Run the App
+
+```bash
+# terminal 1 (repo root)
+source .venv/bin/activate
 python run.py
 ```
 
-**Terminal 2 - Start Frontend (dev server on port 3000):**
 ```bash
+# terminal 2
 cd frontend
 npm run dev
 ```
 
-Then open **http://localhost:3000** in your browser.
+Open `http://localhost:3000`.
 
-### Alternative Backend Commands
+## Demo Flow
 
-If you prefer to run the backend directly:
-```bash
-# Option 1: Using the provided run.py script (recommended)
-python run.py
+1. Search a course code such as `ENGL 1101` or `ITEC 1001`.
+2. Review ranked resources and license information.
+3. Open a resource link and show integration guidance.
 
-# Option 2: Using Python module syntax
-python -m backend.app
+See `DEMO_CHECKLIST.md` for a ready-to-run presenter checklist.
 
-# Option 3: Using custom port
-PORT=9000 python run.py
+## API Quick Reference
 
-# Option 4: Direct (if using setup from project root)
-cd backend
-python app.py
-```
+### Health
 
-## Usage
-
-1. Enter a course code (e.g., ENGL 1101, HIST 2111, ITEC 1001)
-2. Optionally specify the term
-3. Click "Search OER Resources"
-4. Browse the results with quality scores and integration tips
-5. Click on resources to visit them directly
-
-## Running Tests
-
-Test the backend locally:
-```bash
-source venv/bin/activate  # On Windows: venv\Scripts\activate
-python backend/test_simple.py
-```
-
-Test with specific courses:
-```bash
-python backend/test_courses.py
-```
-
-## Building for Production
-
-### Backend
-The Flask app runs as-is. For production:
-```bash
-# Set environment variables
-export FLASK_ENV=production
-
-# Run with production server (requires gunicorn)
-pip install gunicorn
-gunicorn backend.app:app
-```
-
-### Frontend
-Build optimized static files:
-```bash
-cd frontend
-npm run build
-```
-
-Output: `frontend/dist/` - Deploy these files to any static hosting (GitHub Pages, Vercel, Netlify, etc.)
-
-## No API Key Needed
-
-The `.env` file is pre-configured for no-API mode. You don't need to sign up for OpenAI or any other service.
-
-### What Works Without External APIs
-
-- Finding course-related OER from built-in suggestions
-- Quality scores for each resource
-- The complete web interface
-- All main features
-
-## API Endpoints
-
-**Health Check:**
-```
+```http
 GET /api/health
 ```
 
-**Search for OER Resources:**
-```
+### Search
+
+```http
 POST /api/search
 Content-Type: application/json
-
-{
-  "course_code": "ENGL 1101",
-  "term": "Fall 2025"
-}
 ```
 
-**Response:**
 ```json
 {
-  "evaluated_resources": [...],
-  "resources_found": 5
+  "course_code": "ENGL 1101",
+  "term": "Fall 2026"
 }
 ```
 
-## Documentation
+## Core Documentation
 
-- [Backend README](./backend/README.md) - Backend API documentation
-- [Frontend README](./frontend/README.md) - React app documentation
-- [GITHUB_SETUP.md](./GITHUB_SETUP.md) - Guide for pushing to GitHub
-- [REFACTORING_SUMMARY.md](./REFACTORING_SUMMARY.md) - Refactoring details
+- `ARCHITECTURE.md` - current system architecture
+- `DEMO_CHECKLIST.md` - presentation and smoke-test checklist
+- `DEPLOYMENT.md` - local and hosted deployment options
+- `SUPABASE_SETUP.md` - optional Supabase setup
+- `backend/README.md` - backend API and service details
+- `frontend/README.md` - frontend details and build notes
+- `docs/archive/README.md` - archived planning and phase docs
 
-## Architecture
+## Archived Docs
 
-### Frontend (React + Vite)
-- React 18 with functional components and hooks
-- Vite for fast development and optimized production builds
-- Modular CSS with component-scoped styling
-- Axios for API communication
-- Responsive design for all devices
-
-### Backend (Python + Flask)
-- Flask REST API server
-- OER Agent for discovery and evaluation
-- Web scrapers (BeautifulSoup, Selenium)
-- LLM integration (OpenAI, Anthropic) - optional
-- Rubric and license evaluation
-- Comprehensive logging
+Legacy phase/planning docs were moved from the repository root into `docs/archive/` to keep the polished demo surface clean.
 
 ## Troubleshooting
 
-### Frontend won't connect to backend
-- Ensure Flask is running on `http://localhost:5000`
-- Check `frontend/vite.config.js` proxy configuration
-- Check browser console (DevTools) for API errors
-- Verify CORS headers in Flask response
+### Frontend cannot reach backend
 
-### Python modules not found
-```bash
-source venv/bin/activate
-pip install -r backend/requirements.txt
-```
+- Confirm backend is running on `http://localhost:8000`.
+- Confirm `frontend/vite.config.js` proxy target is `http://localhost:8000`.
 
-### Port already in use
-```bash
-# Flask (change from default 5000)
-export PORT=5001 && python backend/app.py
-
-# Vite (change from default 3000)
-cd frontend && npm run dev -- --port 3001
-```
-
-### Module import errors
-If you get import errors, make sure you're running from the correct directory:
-```bash
-# For Flask
-cd /path/to/agentic-oer-finder
-python backend/app.py
-
-# For tests
-python backend/test_simple.py
-```
-
-## Development Workflow
-
-### Adding a New Feature
-
-1. **Backend API**: Add endpoint to `backend/app.py`
-2. **Frontend Component**: Create component in `frontend/src/components/`
-3. **API Service**: Update `frontend/src/services/oerAPI.js`
-4. **Styling**: Add CSS in component folder
-
-### Code Style
-- Python: Follow PEP 8
-- JavaScript/React: ESLint compatible formatting
-
-## Deployment
-
-### Deploy Frontend
-```bash
-cd frontend
-npm run build
-# Deploy frontend/dist/ folder to GitHub Pages, Vercel, Netlify, etc.
-```
-
-### Deploy Backend
-Push to any Python-capable platform (Heroku, Railway, AWS, DigitalOcean, etc.)
-
-Update `.env` variables for production environment.
-
-## GitHub Repository
-
-To push to GitHub:
+### Port conflict
 
 ```bash
-git init
-git add .
-git commit -m "Initial commit: Agentic OER Finder"
-git remote add origin https://github.com/USERNAME/agentic-oer-finder.git
-git branch -M main
-git push -u origin main
+PORT=9000 python run.py
 ```
 
-See [GITHUB_SETUP.md](./GITHUB_SETUP.md) for detailed GitHub setup instructions.
-
-## License
-
-[Add your license information here]
-
-## Support
-
-For issues, questions, or contributions, please open an issue on GitHub.
+Then update the frontend proxy target to the same port.

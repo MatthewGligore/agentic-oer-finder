@@ -1,86 +1,78 @@
-# Supabase Setup Guide
+# Supabase Setup
 
-## Step 1: Create Supabase Project
+Supabase is optional but recommended for stronger syllabus context and faster repeated searches.
 
-1. Go to [supabase.com](https://supabase.com)
-2. Sign up or log in
-3. Click **"New Project"**
-4. Fill in:
-   - **Project name**: `agentic-oer-finder` (or similar)
-   - **Database password**: Create a strong password (save it securely)
-   - **Region**: Select region closest to you (e.g., US-East-1)
-5. Click **"Create new project"** and wait for provisioning (~1-2 min)
+## 1) Create a Supabase Project
 
-## Step 2: Get Your Credentials
+1. Create a new project in Supabase.
+2. Open Settings -> API.
+3. Copy:
+   - `SUPABASE_URL`
+   - `SUPABASE_ANON_KEY`
+   - `SUPABASE_SERVICE_ROLE_KEY`
 
-Once the project is ready:
+Keep the service role key private.
 
-1. Go to **Settings** → **API** (left sidebar)
-2. Copy these three values and add to your `.env` file:
-   ```
-   SUPABASE_URL=https://YOUR_PROJECT_ID.supabase.co
-   SUPABASE_ANON_KEY=your_anon_key_here
-   SUPABASE_SERVICE_ROLE_KEY=your_service_role_key_here
-   ```
-   
-   ⚠️ **Security**: The `SERVICE_ROLE_KEY` is sensitive—treat like an API secret. Never commit to git.
+## 2) Configure Local Environment
 
-3. Create a `.env` file in the `backend/` directory:
-   ```bash
-   cp backend/.env.example backend/.env
-   # Then edit backend/.env and paste your keys
-   ```
+From repo root:
 
-## Step 3: Create Database Schema
-
-1. In Supabase console, go to **SQL Editor** (left sidebar)
-2. Click **"New Query"**
-3. Copy the contents of [schema.sql](schema.sql) (file in this repo)
-4. Paste into the SQL editor and click **"Run"**
-5. Verify tables appear in **Table Editor**:
-   - `syllabuses`
-   - `syllabus_sections`
-
-You should see:
-- Table list in left sidebar
-- Column details: id, course_code, course_title, term, section_number, course_id, instructor_name, syllabus_url, scraped_at, created_at
-- Similar for `syllabus_sections`
-
-## Step 4: Verify Setup
-
-In a Python shell (backend activated):
-```python
-from backend.llm.supabase_client import get_supabase_client
-client = get_supabase_client()
-result = client.table('syllabuses').select('*').execute()
-print(f"Connected! Tables exist: {result.data is not None}")
-```
-
-If you see a success message, you're ready to start scraping!
-
-## Next Steps
-
-After setup, run the bulk scraper:
 ```bash
-cd backend
-python cli.py scrape-syllabuses --limit 10  # Test with 10 syllabuses first
-python cli.py scrape-syllabuses --all       # Full scrape (takes ~30-60 min depending on library size)
+cp .env.example .env
 ```
 
-Monitor progress in console. Check Supabase console to see data populate in real-time.
+Add your keys to `.env`:
+
+```env
+SUPABASE_URL=https://YOUR_PROJECT.supabase.co
+SUPABASE_ANON_KEY=...
+SUPABASE_SERVICE_ROLE_KEY=...
+```
+
+## 3) Create Tables
+
+Run the SQL in `backend/schema.sql` from the Supabase SQL editor.
+
+Expected tables:
+
+- `syllabuses`
+- `syllabus_sections`
+
+## 4) Optional: Seed Syllabus Data
+
+```bash
+source .venv/bin/activate
+python -m backend.cli scrape-syllabuses --limit 10
+```
+
+Then scale up as needed:
+
+```bash
+python -m backend.cli scrape-syllabuses
+```
+
+## 5) Validate Runtime
+
+Start backend and call health/search endpoints:
+
+```bash
+python run.py
+curl http://localhost:8000/api/health
+```
 
 ## Troubleshooting
 
-**Error: "Invalid API key"**
-- Copy credentials exactly (no extra spaces)
-- Ensure `.env` file is in `backend/` directory (not root)
-- Verify keys are from the correct Supabase project
+### Invalid API key
 
-**Error: "Table not found"**
-- Run schema.sql again in Supabase SQL Editor
-- Refresh page and check **Table Editor** shows tables
+- Re-copy keys exactly.
+- Confirm `.env` is in repo root.
+- Confirm keys are from the same Supabase project.
 
-**Connection timeout**
-- Check internet connection
-- Verify Supabase project is running (Status page in console)
-- Try again in 30 seconds
+### Tables missing
+
+- Re-run `backend/schema.sql`.
+- Confirm both expected tables appear in Supabase Table Editor.
+
+### Supabase unavailable
+
+- The app still runs with fallback behavior; searches may be slower/less contextual.
