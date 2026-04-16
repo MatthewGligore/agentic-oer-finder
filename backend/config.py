@@ -58,3 +58,26 @@ class Config:
         'Pedagogical Value',
         'Technical Quality'
     ]
+
+    # Search Source Policy
+    PRIMARY_OER_SOURCES = [
+        'Open ALG Library',
+        'MERLOT',
+        'OER Commons Hub',
+    ]
+    FALLBACK_MIN_PRIMARY_RESULTS = int(os.getenv('FALLBACK_MIN_PRIMARY_RESULTS', '10'))
+
+    # Ranking Weights (final_rank_score = relevance * W1 + rubric * W2)
+    # relevance score is normalized to 1-5 before weighting.
+    RELEVANCE_WEIGHT = float(os.getenv('RELEVANCE_WEIGHT', '0.6'))
+    RUBRIC_WEIGHT = float(os.getenv('RUBRIC_WEIGHT', '0.4'))
+
+    # Candidate and evaluation budgets
+    MAX_PRIMARY_CANDIDATES = int(os.getenv('MAX_PRIMARY_CANDIDATES', '24'))
+    MAX_TOTAL_CANDIDATES = int(os.getenv('MAX_TOTAL_CANDIDATES', '30'))
+    MAX_RELEVANCE_EVALUATIONS = int(os.getenv('MAX_RELEVANCE_EVALUATIONS', '12'))
+    MAX_EVALUATED_RESOURCES = int(os.getenv('MAX_EVALUATED_RESOURCES', '15'))
+
+    # Syllabus-derived query generation
+    MAX_SYLLABUS_QUERY_VARIANTS = int(os.getenv('MAX_SYLLABUS_QUERY_VARIANTS', '5'))
+    MAX_QUERY_TERMS_PER_VARIANT = int(os.getenv('MAX_QUERY_TERMS_PER_VARIANT', '10'))

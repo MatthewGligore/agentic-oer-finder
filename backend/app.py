@@ -10,7 +10,7 @@ import sys
 from datetime import datetime, timezone
 from .oer_agent import OERAgent
 from .config import Config
-from .scrapers.library_index_scraper import fetch_library_index
+from .scrapers.library_index_scraper import fetch_library_index, fetch_library_index_for_course
 from .scrapers.syllabus_content_scraper import fetch_and_parse_syllabus, prepare_section_records
 from .llm.supabase_client import get_supabase_client
 
@@ -61,6 +61,8 @@ def search_oer():
 
         if results.get('course_not_found'):
             logger.info(f"Course not found after scraping: {course_code}")
+            if 'scrape_ui_path' not in results:
+                results['scrape_ui_path'] = '/scrape'
             return jsonify(results), 404
         
         # Debug logging
@@ -154,29 +156,60 @@ def scrape_syllabi_for_course():
             return jsonify({'error': 'Supabase is not configured or unavailable'}), 500
 
         logger.info(f"Syllabus scrape request: course={course_code}, term={term or 'any'}")
-        discovered = fetch_library_index()
+
+        discovered = fetch_library_index_for_course(course_code)
+        if not discovered:
+            logger.info("Targeted syllabus discovery returned 0 rows for %s; falling back to full index crawl", course_code)
+            discovered = fetch_library_index()
 
         def norm_term(value: str) -> str:
             return (value or '').lower().replace(' ', '').replace('_', '-').replace('--', '-')
 
-        matches = [row for row in discovered if row.get('course_code') == course_code]
+        def norm_course(value: str) -> str:
+            return ''.join(ch for ch in (value or '').upper() if ch.isalnum())
+
+        normalized_target = norm_course(course_code)
+
+        matches = [
+            row for row in discovered
+            if norm_course(row.get('course_code', '')) == normalized_target
+        ]
         if term:
             target_term = norm_term(term)
             matches = [row for row in matches if target_term in norm_term(row.get('term', ''))]
 
         if not matches:
+            prefix = ''.join(ch for ch in course_code.upper() if ch.isalpha())
+            number = ''.join(ch for ch in course_code if ch.isdigit())
+            suggestions = []
+            for row in discovered:
+                code = (row.get('course_code') or '').upper()
+                if not code:
+                    continue
+                code_prefix = ''.join(ch for ch in code if ch.isalpha())
+                code_number = ''.join(ch for ch in code if ch.isdigit())
+                if code_prefix == prefix or (number and code_number == number):
+                    suggestions.append(code)
+
+            suggestions = sorted(set(suggestions))[:12]
+
             return jsonify({
                 'course_code': course_code,
                 'term': term,
                 'course_not_found': True,
-                'error': f'No syllabi found for {course_code} in the syllabus library.',
+                'status': 'not_found',
+                'message': (
+                    f'No syllabi found for {course_code} in the currently discovered library index. '
+                    'Try scraping a different term, re-running later, or verifying the course code format.'
+                ),
                 'discovered_count': len(discovered),
                 'matched_count': 0,
                 'inserted_syllabuses': 0,
                 'inserted_sections': 0,
                 'skipped_existing': 0,
                 'failed': 0,
-            }), 404
+                'suggested_course_codes': suggestions,
+            }), 200
 
         if limit > 0:
             matches = matches[:limit]

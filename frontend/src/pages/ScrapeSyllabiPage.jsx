@@ -1,11 +1,11 @@
-import React, { useState } from 'react'
+import React, { useEffect, useState } from 'react'
 import { useNavigate } from 'react-router-dom'
 import oerAPI from '../services/oerAPI'
 import { useAppState } from '../context/AppState'
 
 function ScrapeSyllabiPage() {
   const navigate = useNavigate()
-  const { setCourseCode, setTerm } = useAppState()
+  const { courseCode, term, setCourseCode, setTerm } = useAppState()
 
   const [courseInput, setCourseInput] = useState('')
   const [termInput, setTermInput] = useState('')
@@ -13,6 +13,15 @@ function ScrapeSyllabiPage() {
   const [isLoading, setIsLoading] = useState(false)
   const [error, setError] = useState('')
   const [result, setResult] = useState(null)
+
+  useEffect(() => {
+    if (courseCode && !courseInput) {
+      setCourseInput(courseCode)
+    }
+    if (term && !termInput) {
+      setTermInput(term)
+    }
+  }, [courseCode, term, courseInput, termInput])
 
   const onSubmit = async (event) => {
     event.preventDefault()
@@ -102,16 +111,36 @@ function ScrapeSyllabiPage() {
           {result && (
             <div style={{ marginTop: '1rem' }}>
               <div className="featured-resource-card">
-                <h3 style={{ marginTop: 0 }}>Scrape Complete</h3>
-                <p style={{ marginBottom: '0.75rem', color: 'var(--muted)' }}>{result.message}</p>
+                <h3 style={{ marginTop: 0 }}>{result.course_not_found ? 'No Syllabi Found Yet' : 'Scrape Complete'}</h3>
+                <p style={{ marginBottom: '0.75rem', color: 'var(--muted)' }}>
+                  {result.message || 'Scrape request finished.'}
+                </p>
                 <ul style={{ margin: 0, paddingLeft: '1.2rem' }}>
                   <li>Course: {result.course_code}</li>
                   <li>Matched syllabi: {result.matched_count}</li>
                   <li>Inserted syllabi: {result.inserted_syllabuses}</li>
                   <li>Inserted sections: {result.inserted_sections}</li>
                   <li>Already in DB: {result.skipped_existing}</li>
-                  <li>Total in DB for course: {result.db_total_for_course}</li>
+                  {typeof result.db_total_for_course === 'number' && <li>Total in DB for course: {result.db_total_for_course}</li>}
                 </ul>
+
+                {Array.isArray(result.suggested_course_codes) && result.suggested_course_codes.length > 0 && (
+                  <div style={{ marginTop: '0.8rem' }}>
+                    <p style={{ marginBottom: '0.35rem', color: 'var(--muted)' }}>Possible matches in library index:</p>
+                    <div className="pill-row">
+                      {result.suggested_course_codes.map((code) => (
+                        <button
+                          key={code}
+                          type="button"
+                          className="pill"
+                          onClick={() => setCourseInput(code)}
+                        >
+                          {code}
+                        </button>
+                      ))}
+                    </div>
+                  </div>
+                )}
               </div>
 
               <div style={{ marginTop: '0.75rem', display: 'flex', gap: '0.5rem' }}>

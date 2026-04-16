@@ -53,8 +53,31 @@ function ResultsContentSection({ error, activeCourseLabel, featuredResource, res
 
               <div className="meta-row">
                 <span>{featuredResource.license}</span>
-                <span>Quality: {featuredResource.score.toFixed(1)}/100</span>
+                <span>Final: {featuredResource.finalRankScore.toFixed(1)}/5</span>
+                <span>Rubric: {featuredResource.rubricScore.toFixed(1)}/5</span>
+                <span>Relevance: {featuredResource.relevanceScore.toFixed(1)}/5</span>
               </div>
+
+              {featuredResource.relevanceRationale && (
+                <p className="muted-copy">Why ranked here: {featuredResource.relevanceRationale}</p>
+              )}
+
+              {featuredResource.criteriaList?.length > 0 && (
+                <dl className="criteria-grid criteria-grid-rich">
+                  {featuredResource.criteriaList.map((criterion) => (
+                    <React.Fragment key={criterion.name}>
+                      <dt>{criterion.name}</dt>
+                      <dd>
+                        <span className="criterion-score">{criterion.score.toFixed(1)} / 5</span>
+                        <span className="muted-copy">{criterion.explanation}</span>
+                        <a className="criterion-link" href={criterion.evidenceLink} target="_blank" rel="noopener noreferrer">
+                          Evidence
+                        </a>
+                      </dd>
+                    </React.Fragment>
+                  ))}
+                </dl>
+              )}
 
               <div className="action-row">
                 <Link
@@ -78,8 +101,25 @@ function ResultsContentSection({ error, activeCourseLabel, featuredResource, res
 
               <div className="meta-row compact">
                 <span>{resource.license}</span>
-                <span>{resource.score.toFixed(1)}</span>
+                <span>Final {resource.finalRankScore.toFixed(1)} / 5</span>
+                <span>{resource.sourceTier}</span>
               </div>
+
+              {resource.criteriaList?.length > 0 && (
+                <dl className="criteria-grid">
+                  {resource.criteriaList.slice(0, 3).map((criterion) => (
+                    <React.Fragment key={criterion.name}>
+                      <dt>{criterion.name}</dt>
+                      <dd>
+                        <span className="criterion-score">{criterion.score.toFixed(1)} / 5</span>
+                        <a className="criterion-link" href={criterion.evidenceLink} target="_blank" rel="noopener noreferrer">
+                          Evidence
+                        </a>
+                      </dd>
+                    </React.Fragment>
+                  ))}
+                </dl>
+              )}
 
               <Link
                 to={`/resource/${encodeURIComponent(resource.id)}`}

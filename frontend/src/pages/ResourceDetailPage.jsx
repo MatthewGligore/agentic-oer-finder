@@ -19,7 +19,7 @@ function ResourceDetailPage() {
     return <Navigate to="/results" replace />
   }
 
-  const scorePercent = Math.max(55, Math.min(98, Math.round((resource.score / 100) * 100) || 90))
+  const scorePercent = Math.max(15, Math.min(100, Math.round((resource.finalRankScore / 5) * 100) || 0))
 
   return (
     <main className="canvas with-side-nav">

@@ -7,6 +7,7 @@ import time
 from typing import List, Dict, Optional
 import logging
 import requests
+import re
 
 logger = logging.getLogger(__name__)
 
@@ -196,6 +197,11 @@ class LLMClient:
         
         except Exception as e:
             logger.error(f"Error generating response: {e}")
+            if self.client == 'ollama':
+                message = str(e).lower()
+                if 'connection refused' in message or 'failed to establish' in message:
+                    logger.warning("Ollama is unreachable; switching to no-API fallback mode for this session.")
+                    self.client = 'no-api'
             return None
     
     def identify_oer_resources(self, syllabus_info: Dict, alg_resources: List[Dict]) -> List[Dict]:
@@ -335,6 +341,106 @@ Format your response as structured JSON if possible, or as a clear structured te
         if response:
             return self._parse_evaluation(response, resource, rubric_criteria)
         return {}
+
+    def evaluate_syllabus_relevance(self, resource: Dict, syllabus_context: Dict) -> Dict:
+        """Score semantic relevance between a resource and syllabus-derived context."""
+        title = (resource or {}).get('title', '')
+        description = (resource or {}).get('description', '')
+
+        course_title = (syllabus_context or {}).get('course_title', '')
+        course_description = (syllabus_context or {}).get('course_description', '')
+        objectives = (syllabus_context or {}).get('objectives', [])
+        topics = (syllabus_context or {}).get('topics', [])
+
+        if self.client == 'no-api' or not self.client:
+            return self._fallback_relevance(resource, syllabus_context)
+
+        system_prompt = (
+            "You evaluate how well an OER resource aligns to a course syllabus. "
+            "Return plain text with exactly these lines: score: <1-5>, matched_topics: <comma list>, rationale: <short reason>."
+        )
+
+        prompt = f"""Syllabus Context:
+Course title: {course_title}
+Course description: {course_description[:650]}
+Objectives: {', '.join(objectives[:8])}
+Topics: {', '.join(topics[:12])}
+
+Resource:
+Title: {title}
+Description: {description[:900]}
+URL: {(resource or {}).get('url', '')}
+
+Score this resource for syllabus fit on a 1-5 scale.
+"""
+
+        response = self.generate(prompt, system_prompt=system_prompt, max_tokens=300)
+        if not response:
+            return self._fallback_relevance(resource, syllabus_context)
+
+        score = 3.0
+        matched_topics: List[str] = []
+        rationale = 'LLM relevance evaluation completed.'
+
+        score_match = re.search(r'score\s*:\s*([1-5](?:\.\d+)?)', response, flags=re.IGNORECASE)
+        if score_match:
+            score = float(score_match.group(1))
+
+        topics_match = re.search(r'matched_topics\s*:\s*(.+)', response, flags=re.IGNORECASE)
+        if topics_match:
+            raw = topics_match.group(1).strip()
+            matched_topics = [item.strip() for item in raw.split(',') if item.strip()][:8]
+
+        rationale_match = re.search(r'rationale\s*:\s*(.+)', response, flags=re.IGNORECASE)
+        if rationale_match:
+            rationale = rationale_match.group(1).strip()
+
+        return {
+            'score': max(1.0, min(5.0, score)),
+            'matched_topics': matched_topics,
+            'rationale': rationale,
+            'raw': response,
+        }
+
+    def _fallback_relevance(self, resource: Dict, syllabus_context: Dict) -> Dict:
+        """Rule-based relevance fallback for no-API mode."""
+        title = (resource or {}).get('title', '')
+        url = (resource or {}).get('url', '')
+        description = (resource or {}).get('description', '')
+
+        # Ignore synthetic scraper blurbs that mirror the query and can create false positives.
+        synthetic = 'candidate resource from' in str(description).lower() or 'search for' in str(title).lower()
+        text = f"{title} {' ' if synthetic else description}".lower()
+
+        if 'search for' in title.lower() or '/search' in str(url).lower():
+            return {
+                'score': 1.2,
+                'matched_topics': [],
+                'rationale': 'Generic source search listing; down-ranked against direct resource pages.',
+            }
+
+        topic_terms = [str(t).strip().lower() for t in (syllabus_context or {}).get('topics', []) if str(t).strip()]
+        objective_terms = [str(t).strip().lower() for t in (syllabus_context or {}).get('objectives', []) if str(t).strip()]
+        terms = list(dict.fromkeys(topic_terms + objective_terms))[:25]
+
+        if not terms:
+            return {'score': 3.0, 'matched_topics': [], 'rationale': 'No syllabus topics/objectives available for relevance scoring.'}
+
+        matched = [term for term in terms if term in text]
+        ratio = len(matched) / max(1, min(len(terms), 12))
+        score = 1.0 + (4.0 * min(1.0, ratio))
+
+        url_lower = str(url).lower()
+        if any(token in url_lower for token in ['/merlot/viewmaterial', 'materials.htm?materialid=', '/projects/', '/courseware/']):
+            score += 0.7
+        if any(host in url_lower for host in ['meshresearch.net', 'commons.msu.edu', 'hcommons.org']):
+            score -= 1.0
+
+        return {
+            'score': round(max(1.0, min(5.0, score)), 2),
+            'matched_topics': matched[:8],
+            'rationale': f'Fallback relevance using topic/objective term overlap ({len(matched)} matches).',
+        }
     
     def _format_resources_for_prompt(self, resources: List[Dict]) -> str:
         """Format resources list for LLM prompt"""
@@ -400,14 +506,12 @@ Format your response as structured JSON if possible, or as a clear structured te
             criterion_lower = criterion.lower()
             if criterion_lower in response.lower():
                 # Try to extract score (look for numbers near criterion name)
-                import re
                 pattern = rf'{re.escape(criterion)}[:\s]+(\d+)'
                 match = re.search(pattern, response, re.IGNORECASE)
                 if match:
                     evaluation['criteria_scores'][criterion] = int(match.group(1))
         
         # Extract overall score
-        import re
         overall_match = re.search(r'overall[:\s]+(\d+)', response, re.IGNORECASE)
         if overall_match:
             evaluation['overall_score'] = int(overall_match.group(1))

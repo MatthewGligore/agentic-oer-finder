@@ -6,20 +6,17 @@ function DetailBodySection({ resource, scorePercent }) {
     <>
       <section className="detail-grid">
         <article className="panel syllabus-panel">
-          <h3>Syllabus Module Snapshot</h3>
-
-          <div className="learning-outcome">
-            <span>LO 3.1</span>
-            <p>Nucleophilic Substitution (SN1/SN2)</p>
-          </div>
-          <div className="learning-outcome primary">
-            <span>LO 3.2</span>
-            <p>Elimination Reactions (E1/E2)</p>
-          </div>
-          <div className="learning-outcome">
-            <span>LO 3.3</span>
-            <p>Carbocation Rearrangements</p>
-          </div>
+          <h3>Syllabus Alignment Snapshot</h3>
+          {resource.matchedTopics?.length > 0 ? (
+            resource.matchedTopics.map((topic, idx) => (
+              <div key={`${topic}-${idx}`} className={`learning-outcome ${idx === 0 ? 'primary' : ''}`}>
+                <span>Topic</span>
+                <p>{topic}</p>
+              </div>
+            ))
+          ) : (
+            <p className="muted-copy">No topic-level matches were extracted for this resource.</p>
+          )}
         </article>
 
         <article className="panel score-panel">
@@ -31,13 +28,17 @@ function DetailBodySection({ resource, scorePercent }) {
           </div>
 
           <div className="score-copy">
-            <h3>Strong Alignment</h3>
+            <h3>Scoring Breakdown</h3>
             <p>{resource.guidance}</p>
 
             <div className="meta-row">
               <span>{resource.license}</span>
-              <span>Score: {resource.score.toFixed(1)}/100</span>
+              <span>Final: {resource.finalRankScore.toFixed(1)}/5</span>
+              <span>Rubric: {resource.rubricScore.toFixed(1)}/5</span>
+              <span>Relevance: {resource.relevanceScore.toFixed(1)}/5</span>
             </div>
+
+            {resource.relevanceRationale && <p className="muted-copy">{resource.relevanceRationale}</p>}
 
             <div className="action-row">
               <a href={resource.url} target="_blank" rel="noopener noreferrer">Download Free (OER)</a>
@@ -48,12 +49,25 @@ function DetailBodySection({ resource, scorePercent }) {
       </section>
 
       <section className="panel gap-panel">
-        <h3>Identified Content Gaps</h3>
-        <p>
-          Carbocation rearrangements coverage appears thin in this resource. Consider adding a
-          supplemental module to fully satisfy LO 3.3.
-        </p>
-        <button type="button">Find Supplements</button>
+        <h3>Criterion-Level Evaluation</h3>
+        {resource.criteriaList?.length > 0 ? (
+          <dl className="criteria-grid criteria-grid-rich">
+            {resource.criteriaList.map((criterion) => (
+              <React.Fragment key={criterion.name}>
+                <dt>{criterion.name}</dt>
+                <dd>
+                  <span className="criterion-score">{criterion.score.toFixed(1)} / 5</span>
+                  <span className="muted-copy">{criterion.explanation}</span>
+                  <a className="criterion-link" href={criterion.evidenceLink} target="_blank" rel="noopener noreferrer">
+                    Evidence
+                  </a>
+                </dd>
+              </React.Fragment>
+            ))}
+          </dl>
+        ) : (
+          <p className="muted-copy">No criterion details are available for this resource.</p>
+        )}
       </section>
     </>
   )

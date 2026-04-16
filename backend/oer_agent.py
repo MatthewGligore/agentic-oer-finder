@@ -15,6 +15,9 @@ import requests
 from .config import Config
 from .scrapers.syllabus_scraper import SyllabusScraper
 from .scrapers.alg_scraper import ALGScraper
+from .scrapers.alg_selenium_scraper import ALGSeleniumScraper
+from .scrapers.merlot_selenium_scraper import MerlotSeleniumScraper
+from .scrapers.oer_commons_selenium_scraper import OERCommonsSeleniumScraper
 from .scrapers.platform_aggregator_scraper import PlatformAggregatorScraper
 from .scrapers.library_index_scraper import fetch_library_index
 from .scrapers.syllabus_content_scraper import fetch_and_parse_syllabus, prepare_section_records
@@ -29,6 +32,29 @@ logger = logging.getLogger(__name__)
 
 class OERAgent:
     """Main AI agent for OER identification and evaluation"""
+
+    NOISE_TITLES = {
+        'see more',
+        'learn more',
+        'details',
+        'next',
+        'previous',
+        'home',
+        'search',
+        'materials',
+        'material type',
+        'connections',
+        'go to material',
+        'go to material isexternal',
+    }
+
+    EXCLUDED_FALLBACK_HOSTS = {
+        'hcommons.org',
+        'works.hcommons.org',
+        'meshresearch.commons.msu.edu',
+        'meshresearch.net',
+        'hbcuaffordablelearning.org',
+    }
     
     def __init__(self, llm_provider=None, llm_model=None, use_selenium=False):
         """
@@ -56,6 +82,9 @@ class OERAgent:
         else:
             self.syllabus_scraper = SyllabusScraper(self.config.SYLLABUS_BASE_URL)
         self.alg_scraper = ALGScraper(self.config.ALG_BASE_URL)
+        self.alg_selenium_scraper = ALGSeleniumScraper()
+        self.merlot_selenium_scraper = MerlotSeleniumScraper()
+        self.oer_commons_selenium_scraper = OERCommonsSeleniumScraper()
         self.platform_scraper = PlatformAggregatorScraper()
         self.llm = LLMClient(
             provider=llm_provider or self.config.DEFAULT_LLM_PROVIDER,
@@ -65,6 +94,8 @@ class OERAgent:
         self.rubric_evaluator = RubricEvaluator(self.config.RUBRIC_CRITERIA)
         self.license_checker = LicenseChecker()
         self.logger = UsageLogger(self.config.LOG_DIR)
+        self.relevance_weight = max(0.0, float(self.config.RELEVANCE_WEIGHT))
+        self.rubric_weight = max(0.0, float(self.config.RUBRIC_WEIGHT))
 
     def _clean_field_text(self, text: str) -> str:
         """Remove common markdown/list artifacts from LLM text fields."""
@@ -258,6 +289,21 @@ class OERAgent:
 
         if syllabi:
             syllabus = syllabi[0]
+            if not self._is_valid_scraped_syllabus(syllabus):
+                logger.warning("Live scraper returned placeholder/invalid syllabus for %s", course_code)
+                return {
+                    'course_code': course_code,
+                    'title': course_code,
+                    'description': '',
+                    'from_database': False,
+                    'syllabus_found': False,
+                    'scrape_required': True,
+                    'not_found_reason': (
+                        f"No valid syllabus found for {course_code} in Supabase or live scrape. "
+                        "Use the Syllabus Scraper page to scrape and store this course in Supabase."
+                    ),
+                }
+
             syllabus['from_database'] = False
             syllabus['syllabus_found'] = True
 
@@ -280,8 +326,32 @@ class OERAgent:
             'description': '',
             'from_database': False,
             'syllabus_found': False,
+            'scrape_required': True,
             'not_found_reason': f'No syllabus found for {course_code} in the GGC syllabus library.'
         }
+
+    def _is_valid_scraped_syllabus(self, scraped: Dict) -> bool:
+        """Reject placeholder scrape results that are not a real course syllabus record."""
+        if not scraped:
+            return False
+
+        note = str(scraped.get('note', '')).lower()
+        if 'requires javascript rendering' in note:
+            return False
+
+        url = str(scraped.get('syllabus_url') or scraped.get('url') or '').strip().lower()
+        if not url:
+            return False
+
+        # Root library URL is a placeholder, not a course syllabus record.
+        if url.rstrip('/') == self.config.SYLLABUS_BASE_URL.rstrip('/').lower():
+            return False
+
+        # Prefer entries with explicit library metadata for DB insertion.
+        if not scraped.get('course_id'):
+            return False
+
+        return True
 
     def _normalize_term(self, value: Optional[str]) -> str:
         """Normalize term text for tolerant comparisons."""
@@ -323,7 +393,8 @@ class OERAgent:
             return existing
 
         payload = self._build_syllabus_payload(course_code, term, scraped)
-        if not payload.get('syllabus_url'):
+        if not payload.get('syllabus_url') or not payload.get('course_id'):
+            logger.info("Skipping Supabase insert for %s due to missing syllabus_url/course_id", course_code)
             return None
 
         inserted = self.supabase_client.insert_syllabus(payload)
@@ -368,6 +439,265 @@ class OERAgent:
 
         logger.info(f"Discovered {len(matches)} library index rows for {course_code}; storing first match")
         return self._store_scraped_syllabus_if_possible(course_code, term, matches[0])
+
+    def _syllabus_context_from_info(self, course_code: str, syllabus_info: Dict) -> Dict:
+        """Build normalized syllabus context for query generation and relevance scoring."""
+        sections = (syllabus_info or {}).get('sections') or {}
+        raw_title = (syllabus_info or {}).get('course_title') or (syllabus_info or {}).get('title') or course_code
+        course_title = self._normalize_course_title(raw_title, course_code)
+        course_description = (syllabus_info or {}).get('description', '')
+
+        objective_text = sections.get('objectives') or ''
+        topics_text = sections.get('topics') or sections.get('course_content') or ''
+
+        objectives = self._extract_phrases(objective_text, limit=12)
+        topics = self._extract_phrases(topics_text, limit=20)
+
+        subject_terms = self._subject_seed_terms(course_code, course_title)
+
+        if not topics and course_description:
+            topics = self._extract_phrases(course_description, limit=12)
+
+        if not topics:
+            topics = subject_terms[:8]
+        if not objectives:
+            objectives = subject_terms[:6]
+
+        return {
+            'course_code': course_code,
+            'course_title': str(course_title),
+            'course_description': str(course_description or ''),
+            'objectives': objectives,
+            'topics': topics,
+        }
+
+    def _normalize_course_title(self, title: str, course_code: str) -> str:
+        """Normalize noisy title strings from syllabus cards for query use."""
+        cleaned = ' '.join(str(title or '').split()).strip()
+        if not cleaned:
+            return course_code
+
+        # Many scraped records store term/section identifiers instead of descriptive titles.
+        if re.search(r'\b20\d{2}\b', cleaned) and re.search(r'\bsection\b', cleaned, flags=re.IGNORECASE):
+            return course_code
+
+        return cleaned
+
+    def _subject_seed_terms(self, course_code: str, course_title: str) -> List[str]:
+        """Derive subject concept seeds when syllabus sections are sparse."""
+        subject = (course_code.split()[0] if course_code.split() else course_code).lower()
+        title_lower = (course_title or '').lower()
+
+        seeds = {
+            'engl': ['composition', 'argumentative writing', 'personal narrative', 'research writing', 'rhetoric'],
+            'itec': ['information technology', 'computer systems', 'software', 'digital literacy', 'networking'],
+            'hist': ['historical analysis', 'primary sources', 'american history', 'world history', 'civic context'],
+            'biol': ['biology', 'cell structure', 'genetics', 'evolution', 'scientific method'],
+            'math': ['algebra', 'functions', 'problem solving', 'quantitative reasoning', 'modeling'],
+        }
+
+        for prefix, terms in seeds.items():
+            if subject.startswith(prefix) or prefix in title_lower:
+                return terms
+
+        if 'composition' in title_lower or 'english' in title_lower:
+            return seeds['engl']
+
+        return []
+
+    def _extract_phrases(self, text: str, limit: int = 10) -> List[str]:
+        """Extract concise phrase candidates from free-text syllabus sections."""
+        if not text:
+            return []
+
+        lines = re.split(r'[\n\r\u2022\-\*;]+', str(text))
+        phrases: List[str] = []
+        for line in lines:
+            cleaned = ' '.join(line.split()).strip(' :,.')
+            if len(cleaned) < 4:
+                continue
+            if cleaned.lower().startswith(('week ', 'unit ', 'module ')):
+                cleaned = re.sub(r'^(week|unit|module)\s*\d+\s*:?\s*', '', cleaned, flags=re.IGNORECASE)
+            if cleaned:
+                phrases.append(cleaned)
+
+        # Keep stable insertion order and cap.
+        uniq = list(dict.fromkeys(phrases))
+        return uniq[:limit]
+
+    def _truncate_query_terms(self, text: str) -> str:
+        terms = [token for token in re.split(r'[^a-zA-Z0-9]+', (text or '').strip()) if token]
+        max_terms = max(1, int(self.config.MAX_QUERY_TERMS_PER_VARIANT))
+        return ' '.join(terms[:max_terms])
+
+    def _build_syllabus_queries(self, course_code: str, syllabus_context: Dict) -> List[str]:
+        """Create syllabus-driven query variants; keep course code as low-priority fallback."""
+        title = syllabus_context.get('course_title', '')
+        description = syllabus_context.get('course_description', '')
+        objectives = syllabus_context.get('objectives', [])
+        topics = syllabus_context.get('topics', [])
+
+        variants = []
+        if title:
+            variants.append(self._truncate_query_terms(title))
+        if topics:
+            variants.append(self._truncate_query_terms(' '.join(topics[:6])))
+        if objectives:
+            variants.append(self._truncate_query_terms(' '.join(objectives[:5])))
+        if description:
+            variants.append(self._truncate_query_terms(description))
+
+        subject_seed_terms = self._subject_seed_terms(course_code, title)
+        if subject_seed_terms:
+            variants.append(self._truncate_query_terms(' '.join(subject_seed_terms[:6])))
+
+        # ENGL 1101-style writing concept guardrail to improve first-year composition matching.
+        title_lower = title.lower()
+        if 'english' in title_lower or 'composition' in title_lower or course_code.lower().startswith('engl'):
+            variants.append('first year composition argumentative writing personal narrative research writing')
+
+        # Keep raw course code only as a backstop query variant.
+        variants.append(self._truncate_query_terms(course_code))
+
+        max_variants = max(1, int(self.config.MAX_SYLLABUS_QUERY_VARIANTS))
+        deduped = [item for item in dict.fromkeys([v for v in variants if v.strip()])]
+        return deduped[:max_variants]
+
+    def _search_primary_sources(self, query_variants: List[str], course_code: str) -> List[Dict]:
+        """Search primary libraries with dedicated scrapers."""
+        collected: List[Dict] = []
+        for query in query_variants:
+            try:
+                collected.extend(self.alg_selenium_scraper.search_resources(query, course_code))
+            except Exception as exc:
+                logger.warning("ALG Selenium scraper failed for query '%s': %s", query, exc)
+
+            # Keep the mature requests-based ALG scraper as a reliability backstop
+            # when Selenium search pages return sparse/noisy anchors.
+            try:
+                collected.extend(self.alg_scraper.search_resources(query, course_code))
+            except Exception as exc:
+                logger.warning("ALG requests scraper failed for query '%s': %s", query, exc)
+
+            try:
+                collected.extend(self.merlot_selenium_scraper.search_resources(query, course_code))
+            except Exception as exc:
+                logger.warning("MERLOT Selenium scraper failed for query '%s': %s", query, exc)
+            try:
+                collected.extend(self.oer_commons_selenium_scraper.search_resources(query, course_code))
+            except Exception as exc:
+                logger.warning("OER Commons Selenium scraper failed for query '%s': %s", query, exc)
+
+        merged = self._merge_resources(collected, [])
+        merged = [item for item in merged if not self._is_noise_resource(item)]
+        return merged[: int(self.config.MAX_PRIMARY_CANDIDATES)]
+
+    def _search_fallback_sources(self, query_variants: List[str], course_code: str) -> List[Dict]:
+        """Search non-primary fallback sources using existing aggregator."""
+        collected: List[Dict] = []
+        for query in query_variants[:2]:
+            try:
+                collected.extend(self.platform_scraper.search_resources(query, course_code))
+            except Exception as exc:
+                logger.warning("Fallback platform scraper failed for query '%s': %s", query, exc)
+
+        filtered = [
+            item for item in collected
+            if (item.get('source') or item.get('source_platform') or '') not in self.config.PRIMARY_OER_SOURCES
+        ]
+        filtered = [
+            item for item in filtered
+            if 'search for' not in str(item.get('title', '')).lower()
+            and '/search' not in str(item.get('url', '')).lower()
+        ]
+        filtered = [item for item in filtered if not self._is_noise_resource(item)]
+        return self._merge_resources(filtered, [])
+
+    def _is_noise_resource(self, resource: Dict) -> bool:
+        """Exclude obvious navigation/search artifacts and weak hosts."""
+        title = str(resource.get('title', '')).strip().lower()
+        url = str(resource.get('url', '')).strip().lower()
+
+        if not title or len(title) < 4:
+            return True
+        if title in self.NOISE_TITLES and not self._has_strong_resource_url(url):
+            return True
+        if 'search for' in title:
+            return True
+        if '/search' in url and '/courseware' not in url:
+            return True
+        if any(skip in url for skip in ['/privacy', '/terms', '/contact', '/login', '/signin']):
+            return True
+
+        parsed = urlparse(url)
+        host = parsed.netloc.lower()
+        if host in self.EXCLUDED_FALLBACK_HOSTS:
+            return True
+
+        return False
+
+    def _has_strong_resource_url(self, url: str) -> bool:
+        """Detect detail/resource URLs that should be kept even with weak anchor text."""
+        if not url:
+            return False
+        lowered = url.lower()
+        if '/merlot/viewmaterial' in lowered:
+            return True
+        if 'materials.htm?materialid=' in lowered:
+            return True
+        if '/projects/' in lowered and 'alg.manifoldapp.org' in lowered:
+            return True
+        if '/courseware/' in lowered and 'oercommons.org' in lowered:
+            return True
+        return False
+
+    def _is_primary_source(self, resource: Dict) -> bool:
+        source = resource.get('source') or resource.get('source_platform') or ''
+        return source in self.config.PRIMARY_OER_SOURCES
+
+    def _compute_final_rank_score(self, relevance_score: float, rubric_score: float) -> float:
+        total = self.relevance_weight + self.rubric_weight
+        if total <= 0:
+            return float(rubric_score)
+        return (float(relevance_score) * self.relevance_weight + float(rubric_score) * self.rubric_weight) / total
+
+    def _candidate_prefilter_score(self, resource: Dict, syllabus_context: Dict, course_code: str) -> int:
+        """Cheap pre-evaluation ranking signal based on syllabus term overlap."""
+        text = f"{resource.get('title', '')} {resource.get('description', '')}".lower()
+        title = (resource.get('title', '') or '').lower()
+        url = (resource.get('url', '') or '').lower()
+        topics = [str(t).lower() for t in syllabus_context.get('topics', [])][:12]
+        objectives = [str(o).lower() for o in syllabus_context.get('objectives', [])][:8]
+
+        score = 0
+        for term in topics + objectives:
+            if not term:
+                continue
+            if term in text:
+                score += 3
+            elif any(word and word in text for word in term.split()[:3]):
+                score += 1
+
+        code_subject = (course_code.split()[0] if course_code.split() else course_code).lower()
+        if code_subject and code_subject in text:
+            score += 2
+        if code_subject and code_subject in title:
+            score += 1
+
+        if self._is_primary_source(resource):
+            score += 2
+
+        if self._has_strong_resource_url(url):
+            score += 4
+        if any(host in url for host in ['meshresearch.net', 'commons.msu.edu', 'hcommons.org']):
+            score -= 3
+
+        title_lower = (resource.get('title', '') or '').lower()
+        url_lower = url
+        if 'search for' in title_lower or '/search' in url_lower:
+            score -= 3
+
+        return score
     
     def find_oer_for_course(self, course_code: str, term: str = None) -> Dict:
         """
@@ -413,6 +743,8 @@ class OERAgent:
                     'course_code': course_code,
                     'term': term,
                     'course_not_found': True,
+                    'scrape_required': syllabus_info.get('scrape_required', True),
+                    'scrape_ui_path': '/scrape',
                     'error': message,
                     'syllabus_info': syllabus_info,
                     'resources_found': 0,
@@ -426,44 +758,40 @@ class OERAgent:
             source = "database" if syllabus_info.get('from_database') else "live scrape"
             logger.info(f"Using syllabus information from {source}")
             
-            # Step 2: Search across OER platforms (ALG + partner repositories).
-            logger.info("Step 2: Searching OER platforms...")
-            search_query = f"{course_code} {syllabus_info.get('title', '')}"
-            alg_start = time.time()
-            alg_resources = self.alg_scraper.search_resources(search_query, course_code)
+            # Step 2: Build syllabus-driven query variants and search primary libraries first.
+            logger.info("Step 2: Building syllabus-driven queries and searching primary sources...")
+            syllabus_context = self._syllabus_context_from_info(course_code, syllabus_info)
+            query_variants = self._build_syllabus_queries(course_code, syllabus_context)
+            logger.info("Syllabus query variants for %s: %s", course_code, query_variants)
+
+            primary_start = time.time()
+            primary_resources = self._search_primary_sources(query_variants, course_code)
             logger.info(
-                "ALG scraper found %s resources for query: %s (%.2fs)",
-                len(alg_resources),
-                search_query,
-                time.time() - alg_start,
+                "Primary scrapers found %s resources for %s variants in %.2fs",
+                len(primary_resources),
+                len(query_variants),
+                time.time() - primary_start,
             )
 
-            platform_start = time.time()
-            platform_resources = self.platform_scraper.search_resources(search_query, course_code)
-            logger.info(
-                "Multi-platform scraper found %s resources for query: %s (%.2fs)",
-                len(platform_resources),
-                search_query,
-                time.time() - platform_start,
+            fallback_resources: List[Dict] = []
+            fallback_threshold = int(self.config.FALLBACK_MIN_PRIMARY_RESULTS)
+            if len(primary_resources) < fallback_threshold:
+                logger.info(
+                    "Primary results (%s) below fallback threshold (%s); running fallback sources",
+                    len(primary_resources),
+                    fallback_threshold,
+                )
+                fallback_resources = self._search_fallback_sources(query_variants, course_code)
+                logger.info("Fallback sources returned %s resources", len(fallback_resources))
+
+            all_resources = self._merge_resources(primary_resources, fallback_resources)
+            all_resources = all_resources[: int(self.config.MAX_TOTAL_CANDIDATES)]
+            all_resources = [resource for resource in all_resources if not self._is_noise_resource(resource)]
+
+            all_resources.sort(
+                key=lambda resource: self._candidate_prefilter_score(resource, syllabus_context, course_code),
+                reverse=True,
             )
-            
-            if not alg_resources:
-                logger.warning(f"No resources found in ALG Library for {course_code}")
-                if platform_resources:
-                    logger.info(
-                        "Skipping broader ALG retry because multi-platform scraper already returned %s resources",
-                        len(platform_resources),
-                    )
-                else:
-                    subject = course_code.split()[0] if ' ' in course_code else course_code
-                    alg_resources = self.alg_scraper.search_resources(subject, course_code)
-                    logger.info(f"Broader search found {len(alg_resources)} resources")
-
-                if not platform_resources:
-                    platform_resources = self.platform_scraper.search_resources(subject, course_code)
-                    logger.info(f"Broader multi-platform search found {len(platform_resources)} resources")
-
-            all_resources = self._merge_resources(alg_resources, platform_resources)
 
             if not all_resources:
                 logger.warning(f"No scraper resources found across platforms for {course_code}; trying LLM suggestions")
@@ -493,20 +821,20 @@ class OERAgent:
 
                 return empty_results
 
-            # Step 3: Rank scraper-discovered resources without LLM discovery.
-            logger.info("Step 3: Ranking scraper-discovered OER resources...")
+            # Step 3: Prepare top candidates for evaluation.
+            logger.info("Step 3: Preparing candidate resources for evaluation...")
             identified_resources = [
                 {
                     'resource': resource,
                     'relevance_explanation': f'Scraper-discovered resource for {course_code}',
                     'identified_by': 'scraper'
                 }
-                for resource in all_resources[:12]
+                for resource in all_resources[: int(self.config.MAX_PRIMARY_CANDIDATES)]
             ]
             
             # Step 4: Evaluate each identified resource
-            logger.info("Step 4: Evaluating OER quality...")
-            logger.info(f"Identified resources count: {len(identified_resources)}, ALG resources count: {len(alg_resources)}")
+            logger.info("Step 4: Evaluating syllabus relevance and OER quality...")
+            logger.info("Identified resources count: %s", len(identified_resources))
             evaluated_resources = []
             llm_eval_enabled = True
             
@@ -514,7 +842,9 @@ class OERAgent:
             if not identified_resources:
                 logger.error("ERROR: No identified_resources to evaluate! This should not happen.")
             
-            for idx, identified in enumerate(identified_resources[:10]):  # Limit to top 10
+            max_relevance = int(self.config.MAX_RELEVANCE_EVALUATIONS)
+            max_evaluated = int(self.config.MAX_EVALUATED_RESOURCES)
+            for idx, identified in enumerate(identified_resources[:max_evaluated]):
                 try:
                     logger.info(f"Processing resource {idx+1}/{len(identified_resources)}")
                     resource = identified.get('resource', {})
@@ -533,6 +863,16 @@ class OERAgent:
                     if not resource.get('title'):
                         resource['title'] = resource.get('url', 'Untitled Resource')
                         logger.info(f"Set default title for resource: {resource['title']}")
+
+                    # Syllabus-resource semantic relevance (LLM or fallback rule-based)
+                    relevance_eval = {'score': 3.0, 'matched_topics': [], 'rationale': 'Relevance scoring not executed.'}
+                    if idx < max_relevance:
+                        relevance_eval = self.llm.evaluate_syllabus_relevance(resource, syllabus_context)
+                    elif idx == max_relevance:
+                        logger.info(
+                            "Reached MAX_RELEVANCE_EVALUATIONS=%s; remaining resources keep default relevance",
+                            max_relevance,
+                        )
                     
                     # Get detailed resource information if needed
                     if not resource.get('description') and resource.get('url'):
@@ -592,11 +932,22 @@ class OERAgent:
                         }
                     
                     # Combine evaluations
+                    rubric_score = float(rubric_eval.get('overall_score', 0) or 0)
+                    relevance_score = float(relevance_eval.get('score', 3.0) or 3.0)
+                    final_rank_score = self._compute_final_rank_score(relevance_score, rubric_score)
+                    source_tier = 'primary' if self._is_primary_source(resource) else 'fallback'
+
                     evaluated_resource = {
                         'resource': resource,
                         'relevance_explanation': identified.get('relevance_explanation', ''),
+                        'syllabus_relevance': relevance_eval,
+                        'syllabus_relevance_score': relevance_score,
                         'llm_evaluation': llm_eval,
                         'rubric_evaluation': rubric_eval,
+                        'rubric_score': rubric_score,
+                        'final_rank_score': final_rank_score,
+                        'source_tier': source_tier,
+                        'matched_topics': relevance_eval.get('matched_topics', []),
                         'license_check': license_check,
                         'criterion_links': criterion_links,
                         'integration_guidance': self._generate_integration_guidance(resource, rubric_eval, license_check)
@@ -615,6 +966,12 @@ class OERAgent:
                             minimal_resource = {
                                 'resource': resource,
                                 'relevance_explanation': identified.get('relevance_explanation', f'Resource for {course_code}'),
+                                'syllabus_relevance': {
+                                    'score': 1.0,
+                                    'matched_topics': [],
+                                    'rationale': 'Evaluation failed before relevance scoring completed.'
+                                },
+                                'syllabus_relevance_score': 1.0,
                                 'llm_evaluation': {},
                                 'rubric_evaluation': {
                                     'resource': resource,
@@ -622,6 +979,10 @@ class OERAgent:
                                     'overall_score': 0,
                                     'summary': 'Evaluation failed - resource added with minimal data'
                                 },
+                                'rubric_score': 0.0,
+                                'final_rank_score': 0.0,
+                                'source_tier': 'primary' if self._is_primary_source(resource) else 'fallback',
+                                'matched_topics': [],
                                 'license_check': {
                                     'has_open_license': False,
                                     'license_type': 'Unknown',
@@ -640,9 +1001,13 @@ class OERAgent:
             
             logger.info(f"Created {len(evaluated_resources)} evaluated resources after main loop")
             
-            # Sort by overall quality score
+            # Sort by combined final rank score (syllabus relevance + rubric quality).
             evaluated_resources.sort(
-                key=lambda x: x['rubric_evaluation'].get('overall_score', 0),
+                key=lambda x: (
+                    x.get('final_rank_score', 0),
+                    x.get('rubric_score', 0),
+                    len((x.get('resource') or {}).get('title', '')),
+                ),
                 reverse=True
             )
             
@@ -650,7 +1015,12 @@ class OERAgent:
             processing_time = time.time() - start_time
             
             # Final check before creating results
-            logger.info(f"FINAL CHECK: {len(evaluated_resources)} evaluated_resources, {len(alg_resources)} alg_resources")
+            logger.info(
+                "FINAL CHECK: %s evaluated_resources, %s primary_resources, %s fallback_resources",
+                len(evaluated_resources),
+                len(primary_resources),
+                len(fallback_resources),
+            )
             
             results = {
                 'course_code': course_code,
@@ -658,6 +1028,7 @@ class OERAgent:
                 'syllabus_info': syllabus_info,
                 'resources_found': len(all_resources) if all_resources else len(evaluated_resources),
                 'resources_evaluated': len(evaluated_resources),
+                'query_variants': query_variants,
                 'evaluated_resources': evaluated_resources,
                 'summary': self._generate_summary(evaluated_resources),
                 'processing_time_seconds': processing_time
@@ -705,6 +1076,14 @@ class OERAgent:
         """Merge and deduplicate resource candidates from multiple source scrapers."""
         by_url: Dict[str, Dict] = {}
 
+        source_aliases = {
+            'oer commons': 'OER Commons Hub',
+            'oer commons hub': 'OER Commons Hub',
+            'merlot': 'MERLOT',
+            'open alg library': 'Open ALG Library',
+            'affordable learning georgia (alg)': 'Open ALG Library',
+        }
+
         for resource in (primary or []) + (secondary or []):
             url = self._sanitize_url(resource.get('url', ''))
             if not url:
@@ -712,6 +1091,10 @@ class OERAgent:
 
             normalized = dict(resource)
             normalized['url'] = url
+            source_raw = str(normalized.get('source') or normalized.get('source_platform') or '').strip().lower()
+            if source_raw in source_aliases:
+                normalized['source'] = source_aliases[source_raw]
+                normalized['source_platform'] = source_aliases[source_raw]
 
             existing = by_url.get(url)
             if not existing:
@@ -1074,17 +1457,20 @@ Format as a numbered list."""
                           if r.get('license_check', {}).get('has_open_license', False))
         summary += f"Open Licensed Resources: {open_licensed}/{len(evaluated_resources)}\n"
         
-        # Average quality score
-        avg_score = sum(r.get('rubric_evaluation', {}).get('overall_score', 0) 
-                       for r in evaluated_resources) / len(evaluated_resources)
-        summary += f"Average Quality Score: {avg_score:.1f}/5.0\n\n"
+        # Average quality and ranking signals.
+        avg_rubric = sum(r.get('rubric_evaluation', {}).get('overall_score', 0)
+                 for r in evaluated_resources) / len(evaluated_resources)
+        avg_relevance = sum(float(r.get('syllabus_relevance_score', 0) or 0)
+                    for r in evaluated_resources) / len(evaluated_resources)
+        summary += f"Average Quality Score: {avg_rubric:.1f}/5.0\n"
+        summary += f"Average Syllabus Relevance: {avg_relevance:.1f}/5.0\n\n"
         
         # Top resources
         summary += "Top Recommended Resources:\n"
         for i, resource in enumerate(evaluated_resources[:5], 1):
             title = resource.get('resource', {}).get('title', 'Unknown')
-            score = resource.get('rubric_evaluation', {}).get('overall_score', 0)
-            summary += f"{i}. {title} (Score: {score:.1f}/5.0)\n"
+            score = float(resource.get('final_rank_score', 0) or 0)
+            summary += f"{i}. {title} (Final Rank: {score:.1f}/5.0)\n"
         
         return summary
     

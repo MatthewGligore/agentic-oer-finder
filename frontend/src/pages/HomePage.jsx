@@ -10,6 +10,7 @@ function HomePage() {
     error,
     featuredResource,
     isLoading,
+    missingSyllabus,
     normalizedResources,
     results,
     searchResources,
@@ -118,6 +119,22 @@ function HomePage() {
         </form>
 
         {error && <p className="error-banner">{error}</p>}
+
+        {missingSyllabus && (
+          <div className="empty-results-card" style={{ marginTop: '1rem', textAlign: 'left' }}>
+            <p className="empty-results-title">No syllabus found in Supabase for {missingSyllabus.courseCode}</p>
+            <p>{missingSyllabus.message}</p>
+            <div className="action-row" style={{ marginTop: '0.6rem' }}>
+              <button
+                type="button"
+                className="primary-action"
+                onClick={() => navigate(missingSyllabus.scrapeUiPath || '/scrape')}
+              >
+                Open Syllabus Scraper
+              </button>
+            </div>
+          </div>
+        )}
       </section>
 
       <section className="panel dashboard-results">
@@ -150,7 +167,7 @@ function HomePage() {
 
                   <div className="meta-row">
                     <span>{featuredResource.license}</span>
-                    <span>Score {featuredResource.score.toFixed(1)} / 100</span>
+                    <span>Final score {featuredResource.finalRankScore.toFixed(1)} / 5</span>
                   </div>
 
                   <div className="action-row">
@@ -172,7 +189,7 @@ function HomePage() {
                 <article key={resource.id} className="resource-card">
                   <div className="resource-card-head">
                     <h3>{resource.title}</h3>
-                    <span className="score-chip">{resource.score.toFixed(1)} / 100</span>
+                    <span className="score-chip">{resource.finalRankScore.toFixed(1)} / 5</span>
                   </div>
 
                   <p>{resource.description}</p>
@@ -180,6 +197,7 @@ function HomePage() {
                   <div className="meta-row compact">
                     <span>{resource.license}</span>
                     <span>{resource.source}</span>
+                    <span>{resource.sourceTier}</span>
                   </div>
 
                   <a href={resource.url} target="_blank" rel="noopener noreferrer">
