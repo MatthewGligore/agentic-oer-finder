@@ -2,11 +2,15 @@
 Flask API Backend for Agentic OER Finder
 Provides REST API endpoints for the React frontend
 """
-from flask import Flask, request, jsonify
+from flask import Flask, Response, jsonify, request, stream_with_context
 from flask_cors import CORS
+import json
 import logging
 import os
+from queue import Empty, Queue
 import sys
+import re
+import threading
 from datetime import datetime, timezone
 from .oer_agent import OERAgent
 from .config import Config
@@ -18,13 +22,20 @@ app = Flask(__name__)
 app.config.from_object(Config)
 
 # Enable CORS for API endpoints (allow requests from React frontend)
-CORS(app, resources={r"/api/*": {"origins": ["http://localhost:3000", "http://localhost:8000", "http://127.0.0.1:3000", "http://127.0.0.1:8000"]}})
+CORS(app, resources={r"/api/*": {"origins": Config.CORS_ALLOWED_ORIGINS}})
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 # Initialize agent
 agent = None
+COURSE_CODE_PATTERN = re.compile(r'^[A-Z]{2,6}[- ]?\d{3,4}[A-Z]?$')
+DEMO_MAX_SYLLABI_PER_SCRAPE = max(1, int(getattr(Config, 'DEMO_MAX_SYLLABI_PER_SCRAPE', 10)))
+DEMO_MAX_OER_PER_SEARCH = max(1, int(getattr(Config, 'DEMO_MAX_OER_PER_SEARCH', 10)))
+
+
+def is_valid_course_code(course_code: str) -> bool:
+    return bool(COURSE_CODE_PATTERN.match((course_code or '').strip().upper()))
 
 def get_agent():
     """Get or create OER agent instance"""
@@ -38,6 +49,56 @@ def get_agent():
         raise
     return agent
 
+
+def _get_saved_by_url(course_code: str) -> dict:
+    sb = get_supabase_client()
+    if not sb.is_available():
+        return {}
+    saved_rows = sb.list_saved_resources(course_code)
+    return {row.get('resource_url'): row for row in saved_rows}
+
+
+def _normalize_evaluated_resource(item: dict, rank: int, saved_by_url: dict) -> dict:
+    resource = item.get('resource', {})
+    rubric = item.get('rubric_evaluation', {}) or {}
+    criteria = rubric.get('criteria_evaluations', {}) or {}
+    saved_row = saved_by_url.get(resource.get('url', ''))
+    return {
+        'rank': rank,
+        'title': resource.get('title', 'Untitled Resource'),
+        'description': resource.get('description', ''),
+        'source': resource.get('source') or resource.get('source_platform') or 'Unknown source',
+        'license': item.get('license_check', {}).get('license_type') or resource.get('license') or 'Unknown',
+        'resource_url': resource.get('url', ''),
+        'final_rank_score': round(float(item.get('final_rank_score', 0) or 0), 3),
+        'reasoning_summary': item.get('syllabus_relevance', {}).get('rationale')
+        or rubric.get('summary')
+        or 'Matched by syllabus-aware ranking.',
+        'criteria_scores': {key: value.get('score') for key, value in criteria.items()},
+        'criteria_explanations': {key: value.get('explanation') for key, value in criteria.items()},
+        'saved': bool(saved_row),
+        'saved_id': saved_row.get('id') if saved_row else None,
+        'evaluation_payload': item,
+    }
+
+
+def _normalize_search_results(results: dict, course_code: str, term: str) -> dict:
+    if not isinstance(results.get('evaluated_resources'), list):
+        results['evaluated_resources'] = []
+
+    saved_by_url = _get_saved_by_url(course_code)
+    normalized_resources = []
+    for idx, item in enumerate(results.get('evaluated_resources', [])[:DEMO_MAX_OER_PER_SEARCH], start=1):
+        normalized_resources.append(_normalize_evaluated_resource(item, idx, saved_by_url))
+
+    return {
+        'course_code': results.get('course_code', course_code),
+        'term': results.get('term', term),
+        'resources_found': results.get('resources_found', len(normalized_resources)),
+        'results': normalized_resources,
+        'summary': results.get('summary', ''),
+    }
+
 @app.route('/api/health', methods=['GET'])
 def health():
     """Health check endpoint"""
@@ -47,85 +108,147 @@ def health():
 def search_oer():
     """API endpoint for OER search"""
     try:
-        data = request.get_json()
+        data = request.get_json() or {}
         course_code = data.get('course_code', '').strip().upper()
         term = data.get('term', '').strip()
         
-        if not course_code:
-            return jsonify({'error': 'Course code is required'}), 400
+        if not course_code or not is_valid_course_code(course_code):
+            return jsonify({'error': 'Malformed course code. Expected format like ENGL 1101.'}), 400
         
         logger.info(f"Search request for course: {course_code}")
         
         oer_agent = get_agent()
         results = oer_agent.find_oer_for_course(course_code, term)
 
+        if results.get('error') == 'OLLAMA_UNAVAILABLE':
+            return jsonify({
+                'error': 'Ollama is configured but unavailable. Start Ollama and retry.',
+                'status': 'ollama_unavailable'
+            }), 503
+
         if results.get('course_not_found'):
             logger.info(f"Course not found after scraping: {course_code}")
             if 'scrape_ui_path' not in results:
                 results['scrape_ui_path'] = '/scrape'
             return jsonify(results), 404
+        if results.get('scrape_required'):
+            return jsonify({
+                'error': results.get('error') or f'Syllabus for {course_code} is not stored yet. Scrape syllabi first.',
+                'course_code': course_code,
+                'scrape_required': True,
+                'scrape_ui_path': '/scrape',
+            }), 409
         
-        # Debug logging
-        evaluated_count = len(results.get('evaluated_resources', []))
-        resources_found = results.get('resources_found', 0)
-        logger.info(f"API Response - Resources found: {resources_found}, Evaluated: {evaluated_count}")
-        logger.info(f"Results keys: {list(results.keys())}")
-        
-        # Ensure evaluated_resources is always a list
-        if 'evaluated_resources' not in results:
-            logger.warning("evaluated_resources key missing! Adding empty list.")
-            results['evaluated_resources'] = []
-        elif not isinstance(results['evaluated_resources'], list):
-            logger.warning(f"evaluated_resources is not a list! Type: {type(results['evaluated_resources'])}")
-            results['evaluated_resources'] = []
-        
-        # Verify we can serialize
-        try:
-            import json
-            json_str = json.dumps(results, default=str, ensure_ascii=False)
-            logger.info(f"JSON serialization successful. Length: {len(json_str)}, Evaluated resources in JSON: {json_str.count('evaluated_resources')}")
-        except Exception as e:
-            logger.error(f"JSON serialization failed: {e}", exc_info=True)
-        
-        # Log first resource if exists
-        if evaluated_count > 0:
-            first_resource = results['evaluated_resources'][0]
-            logger.info(f"First resource title: {first_resource.get('resource', {}).get('title', 'N/A')}")
-            logger.info(f"First resource keys: {list(first_resource.keys())}")
-        else:
-            logger.warning("WARNING: Returning 0 evaluated_resources to frontend!")
-        
-        # CRITICAL: Double-check before sending
-        final_evaluated_count = len(results.get('evaluated_resources', []))
-        logger.info(f"BEFORE jsonify: {final_evaluated_count} evaluated_resources in results dict")
-        
-        # Ensure evaluated_resources exists and is a list
-        if 'evaluated_resources' not in results:
-            logger.error("CRITICAL: evaluated_resources key missing in results!")
-            results['evaluated_resources'] = []
-        elif not isinstance(results['evaluated_resources'], list):
-            logger.error(f"CRITICAL: evaluated_resources is not a list! Type: {type(results['evaluated_resources'])}")
-            results['evaluated_resources'] = list(results['evaluated_resources']) if results['evaluated_resources'] else []
-        
-        # Create response
-        response = jsonify(results)
-        
-        # Verify response data
-        try:
-            response_data = response.get_json()
-            response_evaluated_count = len(response_data.get('evaluated_resources', []))
-            logger.info(f"AFTER jsonify: {response_evaluated_count} evaluated_resources in response")
-            if response_evaluated_count != final_evaluated_count:
-                logger.error(f"DATA LOST! Had {final_evaluated_count} but response has {response_evaluated_count}")
-        except:
-            pass
-        
-        logger.info(f"Sending response with {final_evaluated_count} evaluated_resources")
-        return response
+        response_payload = _normalize_search_results(results, course_code, term)
+
+        logger.info(f"Sending response with {len(response_payload.get('results', []))} ranked results")
+        return jsonify(response_payload), 200
     
     except Exception as e:
         logger.error(f"Error in search endpoint: {e}", exc_info=True)
         return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/search/stream', methods=['POST'])
+def search_oer_stream():
+    """Streaming API endpoint that emits each evaluated resource as it completes."""
+    data = request.get_json() or {}
+    course_code = data.get('course_code', '').strip().upper()
+    term = data.get('term', '').strip()
+
+    if not course_code or not is_valid_course_code(course_code):
+        return jsonify({'error': 'Malformed course code. Expected format like ENGL 1101.'}), 400
+
+    logger.info(f"Streaming search request for course: {course_code}")
+
+    def event_line(payload: dict) -> str:
+        return json.dumps(payload) + '\n'
+
+    @stream_with_context
+    def generate():
+        output_queue: Queue = Queue()
+        done_event = threading.Event()
+
+        try:
+            oer_agent = get_agent()
+            saved_by_url = _get_saved_by_url(course_code)
+            stream_rank = 0
+
+            def on_resource_evaluated(event: dict):
+                nonlocal stream_rank
+                if stream_rank >= DEMO_MAX_OER_PER_SEARCH:
+                    return
+                evaluated_item = event.get('evaluated_resource')
+                if not evaluated_item:
+                    return
+                stream_rank += 1
+                normalized = _normalize_evaluated_resource(evaluated_item, stream_rank, saved_by_url)
+                yield_payload = {
+                    'type': 'resource',
+                    'course_code': course_code,
+                    'term': term,
+                    'progress': {
+                        'evaluated_count': event.get('evaluated_count', stream_rank),
+                        'total_candidates': event.get('total_candidates', stream_rank),
+                    },
+                    'resource': normalized,
+                }
+                output_queue.put(event_line(yield_payload))
+
+            def run_search():
+                try:
+                    results = oer_agent.find_oer_for_course(
+                        course_code,
+                        term,
+                        on_resource_evaluated=on_resource_evaluated,
+                    )
+
+                    if results.get('error') == 'OLLAMA_UNAVAILABLE':
+                        output_queue.put(event_line({
+                            'type': 'error',
+                            'status': 'ollama_unavailable',
+                            'error': 'Ollama is configured but unavailable. Start Ollama and retry.',
+                        }))
+                        return
+
+                    if results.get('course_not_found'):
+                        if 'scrape_ui_path' not in results:
+                            results['scrape_ui_path'] = '/scrape'
+                        output_queue.put(event_line({'type': 'not_found', **results}))
+                        return
+
+                    if results.get('scrape_required'):
+                        output_queue.put(event_line({
+                            'type': 'error',
+                            'error': results.get('error') or f'Syllabus for {course_code} is not stored yet. Scrape syllabi first.',
+                            'course_code': course_code,
+                            'scrape_required': True,
+                            'scrape_ui_path': '/scrape',
+                        }))
+                        return
+
+                    final_payload = _normalize_search_results(results, course_code, term)
+                    output_queue.put(event_line({'type': 'complete', **final_payload}))
+                except Exception as e:
+                    logger.error(f"Error in stream search endpoint: {e}", exc_info=True)
+                    output_queue.put(event_line({'type': 'error', 'error': str(e)}))
+                finally:
+                    done_event.set()
+
+            worker = threading.Thread(target=run_search, daemon=True)
+            worker.start()
+
+            while not done_event.is_set() or not output_queue.empty():
+                try:
+                    chunk = output_queue.get(timeout=0.5)
+                    yield chunk
+                except Empty:
+                    continue
+        except Exception as e:
+            logger.error(f"Error in stream search endpoint: {e}", exc_info=True)
+            yield event_line({'type': 'error', 'error': str(e)})
+
+    return Response(generate(), mimetype='application/x-ndjson')
 
 @app.route('/api/stats', methods=['GET'])
 def get_stats():
@@ -146,10 +269,8 @@ def scrape_syllabi_for_course():
         data = request.get_json() or {}
         course_code = data.get('course_code', '').strip().upper()
         term = data.get('term', '').strip()
-        limit = int(data.get('limit') or 0)
-
-        if not course_code:
-            return jsonify({'error': 'Course code is required'}), 400
+        if not course_code or not is_valid_course_code(course_code):
+            return jsonify({'error': 'Malformed course code. Expected format like ENGL 1101.'}), 400
 
         sb = get_supabase_client()
         if not sb.is_available():
@@ -168,12 +289,26 @@ def scrape_syllabi_for_course():
         def norm_course(value: str) -> str:
             return ''.join(ch for ch in (value or '').upper() if ch.isalnum())
 
+        def norm_course_relaxed(value: str) -> str:
+            """
+            Relaxed normalization for source data that drops trailing lab suffixes.
+            Example: CHEM 1211K -> CHEM1211
+            """
+            compact = norm_course(value)
+            return re.sub(r'([A-Z]+)(\d{3,4})[A-Z]$', r'\1\2', compact)
+
         normalized_target = norm_course(course_code)
+        relaxed_target = norm_course_relaxed(course_code)
 
         matches = [
             row for row in discovered
             if norm_course(row.get('course_code', '')) == normalized_target
         ]
+        if not matches:
+            matches = [
+                row for row in discovered
+                if norm_course_relaxed(row.get('course_code', '')) == relaxed_target
+            ]
         if term:
             target_term = norm_term(term)
             matches = [row for row in matches if target_term in norm_term(row.get('term', ''))]
@@ -209,10 +344,15 @@ def scrape_syllabi_for_course():
                 'skipped_existing': 0,
                 'failed': 0,
                 'suggested_course_codes': suggestions,
-            }), 200
+            }), 404
 
-        if limit > 0:
-            matches = matches[:limit]
+        if len(matches) > DEMO_MAX_SYLLABI_PER_SCRAPE:
+            logger.info(
+                "Demo cap applied: limiting scrape candidates from %s to %s",
+                len(matches),
+                DEMO_MAX_SYLLABI_PER_SCRAPE,
+            )
+            matches = matches[:DEMO_MAX_SYLLABI_PER_SCRAPE]
 
         inserted_syllabuses = 0
         inserted_sections = 0
@@ -270,58 +410,72 @@ def scrape_syllabi_for_course():
         logger.error(f"Error scraping syllabi: {e}", exc_info=True)
         return jsonify({'error': str(e)}), 500
 
+
+@app.route('/api/saved-resources', methods=['GET'])
+def list_saved_resources():
+    """List saved resources for all courses or one course code."""
+    course_code = request.args.get('course_code', '').strip().upper()
+    if course_code and not is_valid_course_code(course_code):
+        return jsonify({'error': 'Malformed course code. Expected format like ENGL 1101.'}), 400
+
+    sb = get_supabase_client()
+    if not sb.is_available():
+        return jsonify({'error': 'Supabase is not configured or unavailable'}), 500
+
+    rows = sb.list_saved_resources(course_code or None)
+    return jsonify({'saved_resources': rows}), 200
+
+
+@app.route('/api/saved-resources', methods=['POST'])
+def save_resource():
+    """Save (or update) a resource snapshot."""
+    data = request.get_json() or {}
+    required = ['course_code', 'resource_url', 'title']
+    missing = [field for field in required if not str(data.get(field, '')).strip()]
+    if missing:
+        return jsonify({'error': f"Missing required fields: {', '.join(missing)}"}), 400
+
+    course_code = str(data.get('course_code', '')).strip().upper()
+    if not is_valid_course_code(course_code):
+        return jsonify({'error': 'Malformed course code. Expected format like ENGL 1101.'}), 400
+
+    sb = get_supabase_client()
+    if not sb.is_available():
+        return jsonify({'error': 'Supabase is not configured or unavailable'}), 500
+
+    row = {
+        'course_code': course_code,
+        'resource_url': str(data.get('resource_url', '')).strip(),
+        'title': str(data.get('title', '')).strip(),
+        'description': data.get('description') or '',
+        'source': data.get('source') or '',
+        'license': data.get('license') or '',
+        'final_rank_score': data.get('final_rank_score') or 0,
+        'reasoning_summary': data.get('reasoning_summary') or '',
+        'evaluation_payload': data.get('evaluation_payload') or {},
+    }
+    saved = sb.upsert_saved_resource(row)
+    if not saved:
+        return jsonify({'error': 'Unable to save resource'}), 500
+    return jsonify(saved), 200
+
+
+@app.route('/api/saved-resources/<resource_id>', methods=['DELETE'])
+def delete_saved_resource(resource_id):
+    """Delete saved resource by id."""
+    sb = get_supabase_client()
+    if not sb.is_available():
+        return jsonify({'error': 'Supabase is not configured or unavailable'}), 500
+    deleted = sb.delete_saved_resource(resource_id)
+    if not deleted:
+        return jsonify({'error': 'Saved resource not found'}), 404
+    return jsonify({'deleted': True, 'id': resource_id}), 200
+
 @app.route('/api/courses', methods=['GET'])
 def get_required_courses():
     """Get list of required courses for testing"""
     config = Config()
     return jsonify({'courses': config.REQUIRED_COURSES})
-
-@app.route('/api/test-search', methods=['GET', 'POST'])
-def test_search():
-    """Test endpoint to debug search results"""
-    try:
-        logger.info("Test search endpoint called")
-        oer_agent = get_agent()
-        results = oer_agent.find_oer_for_course("ITEC 1001")
-        
-        evaluated_count = len(results.get('evaluated_resources', []))
-        resources_found = results.get('resources_found', 0)
-        
-        logger.info(f"Test search - Found: {resources_found}, Evaluated: {evaluated_count}")
-        
-        # Return raw results for debugging
-        response_data = {
-            'debug': True,
-            'status': 'success',
-            'resources_found': resources_found,
-            'resources_evaluated': results.get('resources_evaluated', 0),
-            'evaluated_resources_count': evaluated_count,
-            'has_evaluated_resources': 'evaluated_resources' in results,
-            'evaluated_resources_is_list': isinstance(results.get('evaluated_resources', []), list),
-        }
-        
-        # Add first resource info if available
-        if evaluated_count > 0:
-            first_resource = results.get('evaluated_resources', [{}])[0]
-            response_data['first_resource_title'] = first_resource.get('resource', {}).get('title', 'N/A')
-            response_data['first_resource_url'] = first_resource.get('resource', {}).get('url', 'N/A')
-        else:
-            response_data['first_resource_title'] = 'N/A'
-            response_data['first_resource_url'] = 'N/A'
-        
-        # Include full results (but this might be large)
-        response_data['full_results'] = results
-        
-        return jsonify(response_data)
-    except Exception as e:
-        logger.error(f"Error in test search: {e}", exc_info=True)
-        return jsonify({'error': str(e), 'debug': True}), 500
-
-@app.route('/test', methods=['GET'])
-def simple_test():
-    """Simple test endpoint"""
-    return jsonify({'status': 'ok', 'message': 'Flask is running!'})
-
 
 def _warn_on_python_version() -> None:
     """Print a compatibility warning for Python runtimes newer than tested range."""

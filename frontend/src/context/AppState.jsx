@@ -1,4 +1,4 @@
-import React, { createContext, useContext, useEffect, useMemo, useState } from 'react'
+import React, { createContext, useCallback, useContext, useEffect, useMemo, useState } from 'react'
 import oerAPI from '../services/oerAPI'
 
 const AppStateContext = createContext(null)
@@ -11,14 +11,20 @@ export function AppStateProvider({ children }) {
   const [results, setResults] = useState(null)
   const [selectedResource, setSelectedResource] = useState(null)
   const [missingSyllabus, setMissingSyllabus] = useState(null)
+  const [savedResources, setSavedResources] = useState([])
   const [analysisProgress, setAnalysisProgress] = useState(18)
-  const [isDarkMode, setIsDarkMode] = useState(false)
+  const [analysisStage, setAnalysisStage] = useState('Ready')
+  const [analysisDetail, setAnalysisDetail] = useState('Waiting for search.')
+  const [isDarkMode, setIsDarkMode] = useState(true)
+  const [searchStartedAt, setSearchStartedAt] = useState(null)
 
   useEffect(() => {
     const storedTheme = localStorage.getItem('theme')
-    const prefersDark = window.matchMedia('(prefers-color-scheme: dark)').matches
-    const useDark = storedTheme ? storedTheme === 'dark' : prefersDark
-    setIsDarkMode(useDark)
+    if (storedTheme === 'light') {
+      setIsDarkMode(false)
+      return
+    }
+    setIsDarkMode(true)
   }, [])
 
   useEffect(() => {
@@ -28,67 +34,111 @@ export function AppStateProvider({ children }) {
 
   useEffect(() => {
     if (!isLoading) {
+      if (!results) {
+        setAnalysisStage('Ready')
+        setAnalysisDetail('Waiting for search.')
+      }
       return
     }
 
+    const stageForElapsed = (elapsedMs) => {
+      if (elapsedMs < 5000) {
+        return {
+          stage: 'Preparing query',
+          detail: 'Normalizing course input and loading syllabus context.',
+          cap: 34,
+        }
+      }
+      if (elapsedMs < 14000) {
+        return {
+          stage: 'Scraping sources',
+          detail: 'Collecting candidate OER from connected source catalogs.',
+          cap: 70,
+        }
+      }
+      if (elapsedMs < 28000) {
+        return {
+          stage: 'Evaluating resources',
+          detail: 'Scoring quality, alignment, and accessibility rubric criteria.',
+          cap: 90,
+        }
+      }
+      return {
+        stage: 'Final ranking',
+        detail: 'Finalizing ranked recommendations and response payload.',
+        cap: 97,
+      }
+    }
+
     const timer = setInterval(() => {
+      const elapsedMs = Date.now() - (searchStartedAt || Date.now())
+      const { stage, detail, cap } = stageForElapsed(elapsedMs)
+      setAnalysisStage(stage)
+      setAnalysisDetail(detail)
+
       setAnalysisProgress((prev) => {
-        if (prev >= 92) {
+        if (prev >= cap) {
           return prev
         }
 
-        const bump = Math.floor(Math.random() * 8) + 2
-        return Math.min(92, prev + bump)
+        const bump = Math.floor(Math.random() * 6) + 2
+        return Math.min(cap, prev + bump)
       })
-    }, 900)
+    }, 850)
 
     return () => clearInterval(timer)
-  }, [isLoading])
+  }, [isLoading, results, searchStartedAt])
 
   const normalizedResources = useMemo(() => {
-    const raw = results?.evaluated_resources || []
-
+    const raw = results?.results || []
+    const savedByUrl = new Map(savedResources.map((item) => [item.resource_url, item]))
     return raw.map((item, index) => {
-      const resource = item.resource || item
-      const rubricScore = Number(item?.rubric_evaluation?.overall_score || 0)
-      const relevanceScore = Number(item?.syllabus_relevance_score || 0)
-      const finalRankScore = Number(item?.final_rank_score || rubricScore || 0)
-      const criteria = item?.rubric_evaluation?.criteria_evaluations || {}
-      const criterionLinks = item?.criterion_links || {}
-      const criteriaList = Object.entries(criteria).map(([name, data]) => {
-        const evidence = Array.isArray(data?.evidence) ? data.evidence : []
-        const firstEvidenceLink = evidence.find((entry) => entry?.url)?.url || criterionLinks?.[name] || resource.url || '#'
+      const saved = savedByUrl.get(item.resource_url)
+      const resourceUrl = item.resource_url || '#'
+      let hostname = 'resource'
 
-        return {
-          name,
-          score: Number(data?.score || 0),
-          explanation: data?.explanation || 'No explanation available.',
-          evidenceLink: firstEvidenceLink,
-        }
-      })
+      try {
+        hostname = new URL(resourceUrl).hostname.replace(/^www\./, '')
+      } catch {
+        hostname = (item.source || 'resource').toLowerCase()
+      }
+
+      const sourceLower = (item.source || '').toLowerCase()
+      const visualType = sourceLower.includes('youtube')
+        ? 'smart_display'
+        : sourceLower.includes('openstax')
+          ? 'menu_book'
+          : sourceLower.includes('khan')
+            ? 'school'
+            : 'library_books'
+
+      const thumbnailUrl = item.thumbnail_url
+        || item.image_url
+        || item.preview_image
+        || item.evaluation_payload?.thumbnail_url
+        || item.evaluation_payload?.image_url
 
       return {
-        id: item.id || resource.id || `${index}-${resource.url || resource.title || 'resource'}`,
-        title: resource.title || resource.name || 'Untitled Resource',
-        url: resource.url || resource.link || '#',
-        description: resource.description || 'No description available.',
-        license: item?.license_check?.license_type || resource.license || 'Unknown license',
-        source: resource.source || resource.source_platform || 'Unknown source',
-        sourceTier: item?.source_tier || 'primary',
-        sourceSearchUrl: resource.source_search_url || '',
-        score: rubricScore,
-        rubricScore,
-        relevanceScore,
-        finalRankScore,
-        relevanceRationale: item?.syllabus_relevance?.rationale || '',
-        matchedTopics: item?.matched_topics || [],
-        criteria,
-        criteriaList,
-        criterionLinks,
-        guidance: item?.integration_guidance || 'No integration notes available yet.',
+        id: item.id || item.resource_url || `${index}-${item.title || 'resource'}`,
+        rank: item.rank || index + 1,
+        title: item.title || 'Untitled Resource',
+        url: resourceUrl,
+        description: item.description || 'No description available.',
+        license: item.license || 'Unknown license',
+        source: item.source || 'Unknown source',
+        finalRankScore: Number(item.final_rank_score || 0),
+        reasoningSummary: item.reasoning_summary || 'No ranking rationale available.',
+        criteriaScores: item.criteria_scores || {},
+        criteriaExplanations: item.criteria_explanations || {},
+        evaluationPayload: item.evaluation_payload || {},
+        hostname,
+        visualType,
+        thumbnailUrl: thumbnailUrl || `https://www.google.com/s2/favicons?sz=256&domain=${hostname}`,
+        saved: Boolean(saved),
+        savedId: saved?.id || null,
       }
     })
-  }, [results])
+  }, [results, savedResources])
 
   const featuredResource = normalizedResources[0] || null
 
@@ -102,23 +152,106 @@ export function AppStateProvider({ children }) {
     setResults(null)
     setMissingSyllabus(null)
     setSelectedResource(null)
-    setAnalysisProgress(22)
+    setAnalysisProgress(8)
+    setAnalysisStage('Preparing query')
+    setAnalysisDetail('Normalizing course input and loading syllabus context.')
+    setSearchStartedAt(Date.now())
+    setResults({
+      course_code: code,
+      term: searchTerm,
+      resources_found: 0,
+      results: [],
+      summary: '',
+    })
 
     try {
-      const data = await oerAPI.search(code, searchTerm)
-      setResults(data)
-      setAnalysisProgress(100)
-      return true
-    } catch (err) {
-      if (err?.course_not_found) {
+      let streamError = null
+      let streamNotFound = null
+      let streamComplete = null
+
+      await oerAPI.searchStream(code, searchTerm, {
+        onResource: (event) => {
+          const partial = event.resource
+          if (!partial) {
+            return
+          }
+
+          setAnalysisStage('Evaluating resources')
+          const evaluatedCount = Number(event.progress?.evaluated_count || 0)
+          const totalCandidates = Number(event.progress?.total_candidates || evaluatedCount || 1)
+          const pct = Math.min(97, Math.max(25, Math.round((evaluatedCount / Math.max(1, totalCandidates)) * 70 + 20)))
+          setAnalysisProgress(pct)
+          setAnalysisDetail(`Evaluated ${evaluatedCount} of ${totalCandidates} resources...`)
+
+          setResults((prev) => {
+            const current = prev || {
+              course_code: code,
+              term: searchTerm,
+              resources_found: 0,
+              results: [],
+              summary: '',
+            }
+            const existing = current.results || []
+            const deduped = existing.filter((item) => item.resource_url !== partial.resource_url)
+            return {
+              ...current,
+              course_code: event.course_code || current.course_code || code,
+              term: event.term || current.term || searchTerm,
+              resources_found: Math.max(current.resources_found || 0, deduped.length + 1),
+              results: [...deduped, partial],
+            }
+          })
+        },
+        onComplete: (event) => {
+          streamComplete = event
+        },
+        onNotFound: (event) => {
+          streamNotFound = event
+        },
+        onError: (event) => {
+          streamError = event
+        },
+      })
+
+      if (streamError) {
+        throw streamError
+      }
+      if (streamNotFound || streamComplete?.course_not_found || streamComplete?.scrape_required) {
+        const payload = streamNotFound || streamComplete
         setMissingSyllabus({
           courseCode: code,
           term: searchTerm,
-          message: err.error || 'No syllabus found for this course.',
+          message: payload?.error || payload?.summary || 'No stored syllabus found for this course.',
+          scrapeUiPath: payload?.scrape_ui_path || '/scrape',
+        })
+        setError(payload?.error || payload?.summary || 'No stored syllabus found for this course.')
+        setAnalysisStage('Search failed')
+        setAnalysisDetail('Syllabus data is missing for this course.')
+        return false
+      }
+
+      if (streamComplete) {
+        setResults(streamComplete)
+      }
+
+      const saved = await oerAPI.listSavedResources(code)
+      setSavedResources(saved.saved_resources || [])
+      setAnalysisProgress(100)
+      setAnalysisStage('Complete')
+      setAnalysisDetail('Search complete. Ranked resources are ready.')
+      return true
+    } catch (err) {
+      if (err?.scrape_required) {
+        setMissingSyllabus({
+          courseCode: code,
+          term: searchTerm,
+          message: err.error || 'No stored syllabus found for this course.',
           scrapeUiPath: err.scrape_ui_path || '/scrape',
         })
       }
       setError(err.error || 'An error occurred while searching for OER resources. Please try again.')
+      setAnalysisStage('Search failed')
+      setAnalysisDetail('Request failed before ranking completed.')
       console.error('Search error:', err)
       return false
     } finally {
@@ -126,8 +259,34 @@ export function AppStateProvider({ children }) {
     }
   }
 
+  const refreshSavedResources = useCallback(async (code = '') => {
+    const payload = await oerAPI.listSavedResources(code)
+    setSavedResources(payload.saved_resources || [])
+  }, [])
+
+  const toggleSavedResource = async (resource) => {
+    if (resource.saved && resource.savedId) {
+      await oerAPI.deleteSavedResource(resource.savedId)
+    } else {
+      await oerAPI.saveResource({
+        course_code: courseCode,
+        resource_url: resource.url,
+        title: resource.title,
+        description: resource.description,
+        source: resource.source,
+        license: resource.license,
+        final_rank_score: resource.finalRankScore,
+        reasoning_summary: resource.reasoningSummary,
+        evaluation_payload: resource.evaluationPayload,
+      })
+    }
+    await refreshSavedResources(courseCode)
+  }
+
   const value = {
     analysisProgress,
+    analysisStage,
+    analysisDetail,
     courseCode,
     error,
     featuredResource,
@@ -145,6 +304,9 @@ export function AppStateProvider({ children }) {
     setTerm,
     term,
     searchResources,
+    savedResources,
+    refreshSavedResources,
+    toggleSavedResource,
   }
 
   return <AppStateContext.Provider value={value}>{children}</AppStateContext.Provider>

@@ -31,9 +31,6 @@ class ALGScraper:
         '/projects/all',
         '/projects/project-collection/textbooks',
         '/projects/project-collection/ancillary',
-        '/projects/project-collection/adoptions',
-        '/projects/project-collection/research-reports',
-        '/projects/project-collection/training-resources',
     ]
 
     SUBJECT_KEYWORDS = {

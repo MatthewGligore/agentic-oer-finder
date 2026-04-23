@@ -6,12 +6,50 @@ import re
 import os
 from typing import List, Dict, Any, Optional
 from bs4 import BeautifulSoup
-import requests
-from urllib.parse import urljoin, parse_qs, urlparse
+from urllib.parse import urljoin
 
 logger = logging.getLogger(__name__)
 
-LIBRARY_URL = "https://ggc.simplesyllabus.com/en-US/syllabus-library"
+LIBRARY_URL = os.getenv("SYLLABUS_LIBRARY_URL", "https://ggc.simplesyllabus.com/en-US/syllabus-library")
+
+COURSE_TOKEN_RE = re.compile(r'^(\d{3,4})([A-Z]?)$')
+
+
+def _normalize_course_token(token: str) -> Optional[str]:
+    """
+    Normalize a course number token while preserving optional suffix letters.
+
+    Examples:
+      2101   -> 2101
+      1211K  -> 1211K
+    """
+    value = (token or '').strip().upper()
+    if not value:
+        return None
+    match = COURSE_TOKEN_RE.match(value)
+    if not match:
+        return None
+    number, suffix = match.groups()
+    return f"{number}{suffix}"
+
+def _extract_course_number(parts: List[str], index: int) -> Optional[str]:
+    """Extract course number token from hyphen-split URL parts."""
+    if index >= len(parts):
+        return None
+
+    direct = _normalize_course_token(parts[index])
+    if direct:
+        return direct
+
+    # Some URLs separate suffix letters as the next token, e.g. 1211-K.
+    if parts[index].isdigit() and 3 <= len(parts[index]) <= 4 and index + 1 < len(parts):
+        suffix = (parts[index + 1] or '').strip().upper()
+        if len(suffix) == 1 and suffix.isalpha():
+            merged = _normalize_course_token(f"{parts[index]}{suffix}")
+            if merged:
+                return merged
+
+    return None
 
 
 def parse_course_code_from_url(url: str) -> Optional[str]:
@@ -34,12 +72,12 @@ def parse_course_code_from_url(url: str) -> Optional[str]:
         # Split by hyphen and look for pattern like ACCT, COURSE, MATH, etc.
         parts = path_part.split('-')
         
-        # Find course code: pattern is usually [A-Z]{2,} [0-9]{3,4}
+        # Find course code: pattern is usually [A-Z]{2,} + [0-9]{3,4}[optional letter]
         for i in range(len(parts) - 1):
             if parts[i].isalpha() and parts[i].isupper() and len(parts[i]) >= 2:
-                # Next part should be numbers
-                if parts[i + 1] and parts[i + 1][:4].isdigit():
-                    course_code = f"{parts[i]} {parts[i + 1][:4]}"
+                number_token = _extract_course_number(parts, i + 1)
+                if number_token:
+                    course_code = f"{parts[i]} {number_token}"
                     return course_code
         
         return None
@@ -79,8 +117,10 @@ def extract_metadata_from_url(url: str) -> Dict[str, Any]:
             # Find course code
             for i in range(len(parts)):
                 if parts[i].isalpha() and parts[i].isupper() and len(parts[i]) >= 2:
-                    if i + 1 < len(parts) and parts[i + 1][:4].isdigit():
-                        metadata['course_code'] = f"{parts[i]} {parts[i + 1][:4]}"
+                    if i + 1 < len(parts):
+                        number_token = _extract_course_number(parts, i + 1)
+                        if number_token:
+                            metadata['course_code'] = f"{parts[i]} {number_token}"
                     
                     # Section number usually comes after course code
                     if i + 3 < len(parts) and parts[i + 2] == 'Section':
@@ -393,7 +433,6 @@ def fetch_library_index() -> List[Dict[str, Any]]:
             driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
             time.sleep(0.6)
 
-            before = len(syllabuses)
             added = parse_current_page()
             after = len(syllabuses)
             logger.info(f"Page {page_num}: added {added} unique rows (total {after})")
@@ -466,74 +505,3 @@ def fetch_library_index() -> List[Dict[str, Any]]:
             except:
                 pass
 
-
-def fetch_library_index_paginated(max_pages: Optional[int] = None) -> List[Dict[str, Any]]:
-    """
-    Fetch library index with pagination support (if the library implements pagination)
-    
-    Args:
-        max_pages: Maximum number of pages to fetch (None for all)
-    
-    Returns:
-        List of syllabus metadata
-    """
-    all_syllabuses = []
-    page = 1
-    
-    try:
-        while max_pages is None or page <= max_pages:
-            logger.info(f"Fetching page {page}...")
-            
-            # Try fetching with page parameter (common pagination pattern)
-            paginated_url = f"{LIBRARY_URL}?page={page}"
-            response = requests.get(paginated_url, timeout=10)
-            response.raise_for_status()
-            
-            soup = BeautifulSoup(response.content, 'html.parser')
-            syllabus_links = soup.find_all('a', href=re.compile(r'/en-US/doc/'))
-            
-            logger.info(f"Page {page}: Found {len(syllabus_links)} syllabus links")
-            
-            if not syllabus_links:
-                # No more pages
-                logger.info(f"No more syllabuses found at page {page}")
-                break
-            
-            for link in syllabus_links:
-                href = link.get('href', '')
-                if not href:
-                    continue
-                
-                full_url = urljoin(LIBRARY_URL.split('/syllabus-library')[0], href)
-                if 'mode=view' not in full_url:
-                    full_url += '?mode=view'
-                
-                metadata = extract_metadata_from_url(full_url)
-                metadata['syllabus_url'] = full_url
-                
-                if not metadata.get('course_code'):
-                    metadata['course_code'] = parse_course_code_from_url(full_url)
-                
-                if metadata.get('course_code'):
-                    all_syllabuses.append(metadata)
-            
-            page += 1
-    
-    except Exception as e:
-        logger.error(f"Error in paginated fetch: {e}")
-        logger.info(f"Retrieved {len(all_syllabuses)} syllabuses before error")
-    
-    return all_syllabuses
-
-
-if __name__ == '__main__':
-    # Test the scraper
-    logging.basicConfig(level=logging.INFO)
-    
-    syllabuses = fetch_library_index()
-    print(f"\nTotal syllabuses found: {len(syllabuses)}\n")
-    
-    # Print first 5 as examples
-    for i, s in enumerate(syllabuses[:5], 1):
-        print(f"{i}. {s.get('course_code')} - {s.get('term', 'N/A')} (Section {s.get('section_number', 'N/A')})")
-        print(f"   URL: {s.get('syllabus_url')}\n")

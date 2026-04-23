@@ -4,8 +4,7 @@ Orchestrates the complete workflow: syllabus analysis, OER search, evaluation, a
 """
 import time
 import re
-import os
-from typing import Dict, List, Optional
+from typing import Callable, Dict, List, Optional
 import logging
 from urllib.parse import quote_plus, urlparse
 from datetime import datetime, timezone
@@ -18,6 +17,7 @@ from .scrapers.alg_scraper import ALGScraper
 from .scrapers.alg_selenium_scraper import ALGSeleniumScraper
 from .scrapers.merlot_selenium_scraper import MerlotSeleniumScraper
 from .scrapers.oer_commons_selenium_scraper import OERCommonsSeleniumScraper
+from .scrapers.alg_manifold_api_scraper import ALGManifoldAPIScraper
 from .scrapers.platform_aggregator_scraper import PlatformAggregatorScraper
 from .scrapers.library_index_scraper import fetch_library_index
 from .scrapers.syllabus_content_scraper import fetch_and_parse_syllabus, prepare_section_records
@@ -55,6 +55,24 @@ class OERAgent:
         'meshresearch.net',
         'hbcuaffordablelearning.org',
     }
+
+    NON_INSTRUCTIONAL_RESOURCE_PATTERNS = (
+        r'\bresearch grant\b',
+        r'\bresearch report\b',
+        r'\bgrant final report\b',
+        r'\btransformation grant\b',
+        r'\bfinal report summary\b',
+        r'\bgrant summary\b',
+        r'\badoption\b',
+        r'\btraining\b',
+        r'\bstandard operating procedures\b',
+        r'\bkick[\s-]?off\b',
+        r'\badvisory model\b',
+        r'\bsustainability\b',
+        r'\bpromotion and tenure\b',
+        r'\bfaculty\b',
+        r'\blibrarian advocacy\b',
+    )
     
     def __init__(self, llm_provider=None, llm_model=None, use_selenium=False):
         """
@@ -73,7 +91,7 @@ class OERAgent:
         # Use Selenium scraper only if requested and available
         if use_selenium:
             try:
-                from scrapers.syllabus_scraper_selenium import SyllabusScraperSelenium
+                from .scrapers.syllabus_scraper_selenium import SyllabusScraperSelenium
                 self.syllabus_scraper = SyllabusScraperSelenium(self.config.SYLLABUS_BASE_URL)
                 logger.info("Using Selenium scraper for JavaScript-rendered content")
             except ImportError:
@@ -82,6 +100,7 @@ class OERAgent:
         else:
             self.syllabus_scraper = SyllabusScraper(self.config.SYLLABUS_BASE_URL)
         self.alg_scraper = ALGScraper(self.config.ALG_BASE_URL)
+        self.alg_manifold_api_scraper = ALGManifoldAPIScraper(self.config.ALG_BASE_URL)
         self.alg_selenium_scraper = ALGSeleniumScraper()
         self.merlot_selenium_scraper = MerlotSeleniumScraper()
         self.oer_commons_selenium_scraper = OERCommonsSeleniumScraper()
@@ -90,12 +109,21 @@ class OERAgent:
             provider=llm_provider or self.config.DEFAULT_LLM_PROVIDER,
             model=llm_model or self.config.DEFAULT_MODEL
         )
-        self.max_llm_evaluations = int(os.getenv('MAX_LLM_EVALUATIONS', '3'))
+        self.max_llm_evaluations = max(0, int(self.config.MAX_LLM_EVALUATIONS))
+        self.demo_max_oer_per_search = max(1, int(getattr(self.config, 'DEMO_MAX_OER_PER_SEARCH', 10)))
         self.rubric_evaluator = RubricEvaluator(self.config.RUBRIC_CRITERIA)
         self.license_checker = LicenseChecker()
         self.logger = UsageLogger(self.config.LOG_DIR)
         self.relevance_weight = max(0.0, float(self.config.RELEVANCE_WEIGHT))
         self.rubric_weight = max(0.0, float(self.config.RUBRIC_WEIGHT))
+
+    def _safe_scraper_search(self, scraper, scraper_name: str, query: str, course_code: str) -> List[Dict]:
+        """Execute scraper search with defensive logging and stable fallback."""
+        try:
+            return scraper.search_resources(query, course_code) or []
+        except Exception as exc:
+            logger.warning("%s failed for query '%s': %s", scraper_name, query, exc)
+            return []
 
     def _clean_field_text(self, text: str) -> str:
         """Remove common markdown/list artifacts from LLM text fields."""
@@ -447,8 +475,8 @@ class OERAgent:
         course_title = self._normalize_course_title(raw_title, course_code)
         course_description = (syllabus_info or {}).get('description', '')
 
-        objective_text = sections.get('objectives') or ''
-        topics_text = sections.get('topics') or sections.get('course_content') or ''
+        objective_text = sections.get('objectives') or sections.get('other') or ''
+        topics_text = sections.get('topics') or sections.get('course_content') or sections.get('resources') or ''
 
         objectives = self._extract_phrases(objective_text, limit=12)
         topics = self._extract_phrases(topics_text, limit=20)
@@ -463,12 +491,21 @@ class OERAgent:
         if not objectives:
             objectives = subject_terms[:6]
 
+        search_profile = self._build_course_search_profile(
+            course_code=course_code,
+            course_title=course_title,
+            course_description=course_description,
+            objectives=objectives,
+            topics=topics,
+        )
+
         return {
             'course_code': course_code,
             'course_title': str(course_title),
             'course_description': str(course_description or ''),
             'objectives': objectives,
             'topics': topics,
+            'search_profile': search_profile,
         }
 
     def _normalize_course_title(self, title: str, course_code: str) -> str:
@@ -493,6 +530,7 @@ class OERAgent:
             'itec': ['information technology', 'computer systems', 'software', 'digital literacy', 'networking'],
             'hist': ['historical analysis', 'primary sources', 'american history', 'world history', 'civic context'],
             'biol': ['biology', 'cell structure', 'genetics', 'evolution', 'scientific method'],
+            'chem': ['chemistry', 'general chemistry', 'chemical reactions', 'stoichiometry', 'atomic structure'],
             'math': ['algebra', 'functions', 'problem solving', 'quantitative reasoning', 'modeling'],
         }
 
@@ -505,6 +543,264 @@ class OERAgent:
 
         return []
 
+    def _build_course_search_profile(
+        self,
+        course_code: str,
+        course_title: str,
+        course_description: str,
+        objectives: List[str],
+        topics: List[str],
+    ) -> Dict:
+        """Infer search aliases and matching guardrails from syllabus context."""
+        combined = ' '.join(
+            [course_title or '', course_description or '', ' '.join(objectives or []), ' '.join(topics or [])]
+        ).lower()
+
+        profile = {
+            'canonical_title': course_title if course_title and course_title != course_code else '',
+            'preferred_queries': [],
+            'required_terms': [],
+            'excluded_terms': [],
+            'boost_terms': [],
+            'strict_matching': False,
+        }
+
+        if course_title and course_title != course_code:
+            profile['preferred_queries'].append(course_title)
+
+        if self._looks_like_english_composition(course_code, combined):
+            profile.update({
+                'canonical_title': 'English Composition',
+                'preferred_queries': [
+                    'english composition',
+                    'english composition i',
+                    'first year composition',
+                    'college reading and writing',
+                    'expository writing rhetoric',
+                    'research writing rhetoric',
+                ],
+                'required_terms': ['composition', 'writing', 'rhetoric', 'essay', 'research', 'reading'],
+                'excluded_terms': [
+                    'elementary french',
+                    'french',
+                    'spanish',
+                    'german',
+                    'italian',
+                    'calculus',
+                    'chemistry',
+                    'biology',
+                    'physics',
+                ],
+                'boost_terms': [
+                    'expository writing',
+                    'persuasive writing',
+                    'argumentative writing',
+                    'rhetorical situation',
+                    'writing process',
+                    'audience purpose context',
+                    'research writing',
+                    'critical reading',
+                ],
+                'strict_matching': True,
+            })
+        elif self._looks_like_intro_information_technology(course_code, combined):
+            profile.update({
+                'canonical_title': 'Introduction to Information Technology',
+                'preferred_queries': [
+                    'introduction to computing',
+                    'introduction to information technology',
+                    'information technology fundamentals',
+                    'computer information systems fundamentals',
+                    'digital literacy and computer systems',
+                    'information systems and networking basics',
+                ],
+                'required_terms': ['information technology', 'computer', 'software', 'systems', 'digital', 'networking'],
+                'excluded_terms': [
+                    'elementary french',
+                    'french',
+                    'spanish',
+                    'german',
+                    'italian',
+                    'general chemistry',
+                    'organic chemistry',
+                    'american history',
+                    'world history',
+                ],
+                'boost_terms': [
+                    'it fundamentals',
+                    'computer hardware software',
+                    'operating systems basics',
+                    'networking basics',
+                    'cybersecurity fundamentals',
+                    'digital literacy',
+                    'information systems concepts',
+                ],
+                'strict_matching': True,
+            })
+        elif self._looks_like_intro_chemistry(course_code, combined):
+            profile.update({
+                'canonical_title': 'General Chemistry',
+                'preferred_queries': [
+                    'chemistry',
+                    'general chemistry',
+                    'introductory chemistry',
+                    'college chemistry',
+                    'chemistry with laboratory',
+                    'chemical principles and reactions',
+                ],
+                'required_terms': ['chemistry', 'chemical', 'atom', 'molecule', 'reaction', 'stoichiometry', 'lab'],
+                'excluded_terms': [
+                    'elementary french',
+                    'french',
+                    'spanish',
+                    'german',
+                    'italian',
+                    'first year composition',
+                    'english composition',
+                    'rhetoric',
+                    'networking basics',
+                    'information technology',
+                ],
+                'boost_terms': [
+                    'general chemistry',
+                    'chemical reactions',
+                    'stoichiometry',
+                    'atomic structure',
+                    'periodic trends',
+                    'chemical bonding',
+                    'laboratory techniques',
+                    'solutions and concentration',
+                ],
+                'strict_matching': True,
+            })
+        elif self._looks_like_us_history(course_code, combined):
+            profile.update({
+                'canonical_title': 'US History',
+                'preferred_queries': [
+                    'us history',
+                    'united states history',
+                    'american history',
+                    'survey of us history',
+                    'history of the united states',
+                ],
+                'required_terms': ['history', 'us', 'united states', 'american'],
+                'excluded_terms': [
+                    'world history',
+                    'european history',
+                    'ancient history',
+                    'elementary french',
+                    'french',
+                    'spanish',
+                    'german',
+                    'italian',
+                ],
+                'boost_terms': [
+                    'us history',
+                    'american history',
+                    'historical analysis',
+                    'primary sources',
+                    'civil war reconstruction',
+                    'industrialization and reform',
+                ],
+                'strict_matching': True,
+            })
+        else:
+            seed_terms = self._subject_seed_terms(course_code, course_title)
+            profile['boost_terms'] = seed_terms[:8]
+
+        profile['boost_terms'].extend(self._extract_search_terms(objectives + topics, limit=10))
+        profile['preferred_queries'] = list(dict.fromkeys([q.strip() for q in profile['preferred_queries'] if q.strip()]))
+        profile['required_terms'] = list(dict.fromkeys([q.strip().lower() for q in profile['required_terms'] if q.strip()]))
+        profile['excluded_terms'] = list(dict.fromkeys([q.strip().lower() for q in profile['excluded_terms'] if q.strip()]))
+        profile['boost_terms'] = list(dict.fromkeys([q.strip() for q in profile['boost_terms'] if q.strip()]))
+        return profile
+
+    def _looks_like_english_composition(self, course_code: str, combined_text: str) -> bool:
+        """Detect first-year composition style courses from code and syllabus language."""
+        if course_code.lower().startswith('engl'):
+            return True
+
+        english_signals = [
+            'english composition',
+            'first year composition',
+            'college composition',
+            'expository writing',
+            'persuasive writing',
+            'research writing',
+            'rhetorical situation',
+        ]
+        return sum(1 for signal in english_signals if signal in combined_text) >= 2
+
+    def _looks_like_intro_information_technology(self, course_code: str, combined_text: str) -> bool:
+        """Detect intro information technology style courses from code and syllabus language."""
+        subject = course_code.lower().split()[0] if course_code else ""
+        if subject.startswith('itec') or subject.startswith('cis') or subject.startswith('it'):
+            return True
+
+        it_signals = [
+            'information technology',
+            'computer systems',
+            'information systems',
+            'digital literacy',
+            'networking',
+            'software applications',
+            'it fundamentals',
+        ]
+        return sum(1 for signal in it_signals if signal in combined_text) >= 2
+
+    def _looks_like_intro_chemistry(self, course_code: str, combined_text: str) -> bool:
+        """Detect chemistry courses from code and syllabus language."""
+        subject = course_code.lower().split()[0] if course_code else ""
+        if subject.startswith('chem'):
+            return True
+
+        chem_signals = [
+            'general chemistry',
+            'introductory chemistry',
+            'chemical concepts',
+            'chemical reactions',
+            'stoichiometry',
+            'atomic structure',
+            'periodic table',
+            'chemical bonding',
+            'laboratory skills',
+        ]
+        return sum(1 for signal in chem_signals if signal in combined_text) >= 2
+
+    def _looks_like_us_history(self, course_code: str, combined_text: str) -> bool:
+        """Detect introductory US history courses from code and syllabus language."""
+        subject = course_code.lower().split()[0] if course_code else ""
+        if subject.startswith('hist'):
+            return True
+
+        history_signals = [
+            'us history',
+            'united states history',
+            'american history',
+            'history of the united states',
+            'civil war',
+            'reconstruction',
+            'industrialization',
+            'historical analysis',
+            'primary sources',
+        ]
+        return sum(1 for signal in history_signals if signal in combined_text) >= 2
+
+    def _extract_search_terms(self, phrases: List[str], limit: int = 8) -> List[str]:
+        """Convert syllabus phrases into shorter search-oriented topic strings."""
+        terms: List[str] = []
+        for phrase in phrases:
+            cleaned = ' '.join(str(phrase or '').split()).strip(' :,.').lower()
+            if not cleaned:
+                continue
+            cleaned = re.sub(r'\([^)]{1,24}\)', '', cleaned)
+            cleaned = re.sub(r'^(upon completion of this course, students will|students will|learners will)\s*:?','', cleaned, flags=re.IGNORECASE)
+            cleaned = cleaned.strip(' :,.')
+            if len(cleaned) < 4:
+                continue
+            terms.append(cleaned)
+        return list(dict.fromkeys(terms))[:limit]
+
     def _extract_phrases(self, text: str, limit: int = 10) -> List[str]:
         """Extract concise phrase candidates from free-text syllabus sections."""
         if not text:
@@ -514,6 +810,13 @@ class OERAgent:
         phrases: List[str] = []
         for line in lines:
             cleaned = ' '.join(line.split()).strip(' :,.')
+            cleaned = re.sub(r'\([^)]{1,24}\)', '', cleaned)
+            cleaned = re.sub(
+                r'^(upon completion of this course, students will|students will|learners will)\s*[:]?\s*',
+                '',
+                cleaned,
+                flags=re.IGNORECASE,
+            )
             if len(cleaned) < 4:
                 continue
             if cleaned.lower().startswith(('week ', 'unit ', 'module ')):
@@ -536,9 +839,12 @@ class OERAgent:
         description = syllabus_context.get('course_description', '')
         objectives = syllabus_context.get('objectives', [])
         topics = syllabus_context.get('topics', [])
+        search_profile = syllabus_context.get('search_profile', {}) or {}
 
         variants = []
-        if title:
+        for preferred in search_profile.get('preferred_queries', [])[:3]:
+            variants.append(self._truncate_query_terms(preferred))
+        if title and title != course_code:
             variants.append(self._truncate_query_terms(title))
         if topics:
             variants.append(self._truncate_query_terms(' '.join(topics[:6])))
@@ -547,59 +853,114 @@ class OERAgent:
         if description:
             variants.append(self._truncate_query_terms(description))
 
+        if search_profile.get('boost_terms'):
+            variants.append(self._truncate_query_terms(' '.join(search_profile['boost_terms'][:6])))
+
         subject_seed_terms = self._subject_seed_terms(course_code, title)
         if subject_seed_terms:
             variants.append(self._truncate_query_terms(' '.join(subject_seed_terms[:6])))
-
-        # ENGL 1101-style writing concept guardrail to improve first-year composition matching.
-        title_lower = title.lower()
-        if 'english' in title_lower or 'composition' in title_lower or course_code.lower().startswith('engl'):
-            variants.append('first year composition argumentative writing personal narrative research writing')
 
         # Keep raw course code only as a backstop query variant.
         variants.append(self._truncate_query_terms(course_code))
 
         max_variants = max(1, int(self.config.MAX_SYLLABUS_QUERY_VARIANTS))
         deduped = [item for item in dict.fromkeys([v for v in variants if v.strip()])]
+
+        if search_profile.get('strict_matching'):
+            required_terms = [str(term).lower().strip() for term in search_profile.get('required_terms', []) if str(term).strip()]
+            if required_terms:
+                anchored = []
+                for variant in deduped:
+                    variant_lower = variant.lower()
+                    if any(term in variant_lower for term in required_terms):
+                        anchored.append(variant)
+                if anchored:
+                    deduped = anchored
+
         return deduped[:max_variants]
 
-    def _search_primary_sources(self, query_variants: List[str], course_code: str) -> List[Dict]:
+    def _search_primary_sources(self, query_variants: List[str], course_code: str, syllabus_context: Dict) -> List[Dict]:
         """Search primary libraries with dedicated scrapers."""
         collected: List[Dict] = []
+        alg_requests_attempted = False
         for query in query_variants:
-            try:
-                collected.extend(self.alg_selenium_scraper.search_resources(query, course_code))
-            except Exception as exc:
-                logger.warning("ALG Selenium scraper failed for query '%s': %s", query, exc)
+            alg_query_results: List[Dict] = []
+            # Preferred path: use documented Manifold APIs when exposed.
+            alg_query_results.extend(
+                self._safe_scraper_search(
+                    self.alg_manifold_api_scraper,
+                    'ALG Manifold API scraper',
+                    query,
+                    course_code,
+                )
+            )
+            alg_query_results.extend(
+                self._safe_scraper_search(
+                    self.alg_selenium_scraper,
+                    'ALG Selenium scraper',
+                    query,
+                    course_code,
+                )
+            )
 
             # Keep the mature requests-based ALG scraper as a reliability backstop
-            # when Selenium search pages return sparse/noisy anchors.
-            try:
-                collected.extend(self.alg_scraper.search_resources(query, course_code))
-            except Exception as exc:
-                logger.warning("ALG requests scraper failed for query '%s': %s", query, exc)
+            # only when API+Selenium paths fail to produce any candidates.
+            if not alg_query_results and not alg_requests_attempted:
+                alg_requests_attempted = True
+                alg_query_results.extend(
+                    self._safe_scraper_search(
+                        self.alg_scraper,
+                        'ALG requests scraper',
+                        query,
+                        course_code,
+                    )
+                )
+            elif not alg_query_results and alg_requests_attempted:
+                logger.debug(
+                    "Skipping ALG requests scraper for query '%s'; backstop already attempted this search",
+                    query,
+                )
+            else:
+                logger.debug(
+                    "Skipping ALG requests scraper for query '%s' because faster ALG paths returned %s candidates",
+                    query,
+                    len(alg_query_results),
+                )
 
-            try:
-                collected.extend(self.merlot_selenium_scraper.search_resources(query, course_code))
-            except Exception as exc:
-                logger.warning("MERLOT Selenium scraper failed for query '%s': %s", query, exc)
-            try:
-                collected.extend(self.oer_commons_selenium_scraper.search_resources(query, course_code))
-            except Exception as exc:
-                logger.warning("OER Commons Selenium scraper failed for query '%s': %s", query, exc)
+            collected.extend(alg_query_results)
+            collected.extend(
+                self._safe_scraper_search(
+                    self.merlot_selenium_scraper,
+                    'MERLOT Selenium scraper',
+                    query,
+                    course_code,
+                )
+            )
+            collected.extend(
+                self._safe_scraper_search(
+                    self.oer_commons_selenium_scraper,
+                    'OER Commons Selenium scraper',
+                    query,
+                    course_code,
+                )
+            )
 
         merged = self._merge_resources(collected, [])
-        merged = [item for item in merged if not self._is_noise_resource(item)]
+        merged = [item for item in merged if self._resource_matches_course_profile(item, syllabus_context)]
         return merged[: int(self.config.MAX_PRIMARY_CANDIDATES)]
 
-    def _search_fallback_sources(self, query_variants: List[str], course_code: str) -> List[Dict]:
+    def _search_fallback_sources(self, query_variants: List[str], course_code: str, syllabus_context: Dict) -> List[Dict]:
         """Search non-primary fallback sources using existing aggregator."""
         collected: List[Dict] = []
         for query in query_variants[:2]:
-            try:
-                collected.extend(self.platform_scraper.search_resources(query, course_code))
-            except Exception as exc:
-                logger.warning("Fallback platform scraper failed for query '%s': %s", query, exc)
+            collected.extend(
+                self._safe_scraper_search(
+                    self.platform_scraper,
+                    'Fallback platform scraper',
+                    query,
+                    course_code,
+                )
+            )
 
         filtered = [
             item for item in collected
@@ -611,12 +972,14 @@ class OERAgent:
             and '/search' not in str(item.get('url', '')).lower()
         ]
         filtered = [item for item in filtered if not self._is_noise_resource(item)]
+        filtered = [item for item in filtered if self._resource_matches_course_profile(item, syllabus_context)]
         return self._merge_resources(filtered, [])
 
     def _is_noise_resource(self, resource: Dict) -> bool:
         """Exclude obvious navigation/search artifacts and weak hosts."""
         title = str(resource.get('title', '')).strip().lower()
         url = str(resource.get('url', '')).strip().lower()
+        source_page = str(resource.get('source_page', '')).strip().lower()
 
         if not title or len(title) < 4:
             return True
@@ -628,6 +991,10 @@ class OERAgent:
             return True
         if any(skip in url for skip in ['/privacy', '/terms', '/contact', '/login', '/signin']):
             return True
+        if any(collection in source_page for collection in ['/adoptions', '/research-reports', '/training-resources']):
+            return True
+        if self._is_non_instructional_resource(resource):
+            return True
 
         parsed = urlparse(url)
         host = parsed.netloc.lower()
@@ -635,6 +1002,83 @@ class OERAgent:
             return True
 
         return False
+
+    def _is_non_instructional_resource(self, resource: Dict) -> bool:
+        """Filter ALG program metadata that is not a course material."""
+        text = ' '.join([
+            str(resource.get('title', '')),
+            str(resource.get('description', '')),
+            str(resource.get('source_page', '')),
+        ]).lower()
+        return any(re.search(pattern, text, flags=re.IGNORECASE) for pattern in self.NON_INSTRUCTIONAL_RESOURCE_PATTERNS)
+
+    def _resource_matches_course_profile(self, resource: Dict, syllabus_context: Dict) -> bool:
+        """Apply syllabus-driven guardrails before ranking and LLM evaluation."""
+        if self._is_noise_resource(resource):
+            return False
+
+        profile = (syllabus_context or {}).get('search_profile', {}) or {}
+        if not profile.get('strict_matching'):
+            return True
+
+        text = ' '.join([
+            str(resource.get('title', '')),
+            str(resource.get('description', '')),
+            str(resource.get('url', '')),
+            str(resource.get('query', '')),
+            str(resource.get('source_search_url', '')),
+            str(resource.get('source_page', '')),
+        ]).lower()
+        if not text.strip():
+            return False
+
+        for phrase in profile.get('preferred_queries', []):
+            phrase_lower = phrase.lower().strip()
+            if phrase_lower and phrase_lower in text:
+                return True
+
+        required_terms = [term for term in profile.get('required_terms', []) if term]
+        excluded_terms = [term for term in profile.get('excluded_terms', []) if term]
+        if any(term in text for term in excluded_terms):
+            return False
+        matched_terms = [term for term in required_terms if term in text]
+        return len(set(matched_terms)) >= 2
+
+    def _is_source_match(self, resource: Dict, expected_source: str) -> bool:
+        """Case-insensitive source comparison across normalized source fields."""
+        source = str(resource.get('source') or resource.get('source_platform') or '').strip().lower()
+        return source == expected_source.strip().lower()
+
+    def _balance_primary_source_mix(self, resources: List[Dict], limit: int) -> List[Dict]:
+        """
+        Keep a near 50/50 OpenALG/MERLOT mix when both sources exist.
+
+        Selection preserves original ranking order while reserving source quotas.
+        """
+        if limit <= 0 or not resources:
+            return []
+
+        alg_indices = [idx for idx, item in enumerate(resources) if self._is_source_match(item, 'Open ALG Library')]
+        merlot_indices = [idx for idx, item in enumerate(resources) if self._is_source_match(item, 'MERLOT')]
+
+        if not alg_indices or not merlot_indices:
+            return resources[:limit]
+
+        per_source_quota = limit // 2
+        selected_indices = set(alg_indices[:per_source_quota] + merlot_indices[:per_source_quota])
+
+        ordered_selection = [resources[idx] for idx in range(len(resources)) if idx in selected_indices]
+        if len(ordered_selection) >= limit:
+            return ordered_selection[:limit]
+
+        for idx, item in enumerate(resources):
+            if idx in selected_indices:
+                continue
+            ordered_selection.append(item)
+            if len(ordered_selection) >= limit:
+                break
+
+        return ordered_selection
 
     def _has_strong_resource_url(self, url: str) -> bool:
         """Detect detail/resource URLs that should be kept even with weak anchor text."""
@@ -668,6 +1112,7 @@ class OERAgent:
         url = (resource.get('url', '') or '').lower()
         topics = [str(t).lower() for t in syllabus_context.get('topics', [])][:12]
         objectives = [str(o).lower() for o in syllabus_context.get('objectives', [])][:8]
+        search_profile = syllabus_context.get('search_profile', {}) or {}
 
         score = 0
         for term in topics + objectives:
@@ -696,10 +1141,29 @@ class OERAgent:
         url_lower = url
         if 'search for' in title_lower or '/search' in url_lower:
             score -= 3
+        if self._is_non_instructional_resource(resource):
+            score -= 8
+
+        for phrase in search_profile.get('preferred_queries', []):
+            phrase_lower = phrase.lower()
+            if phrase_lower and phrase_lower in text:
+                score += 6
+
+        required_terms = [term for term in search_profile.get('required_terms', []) if term]
+        excluded_terms = [term for term in search_profile.get('excluded_terms', []) if term]
+        matched_required = sum(1 for term in required_terms if term in text)
+        score += matched_required * 2
+        if any(term in text for term in excluded_terms):
+            score -= 10
 
         return score
-    
-    def find_oer_for_course(self, course_code: str, term: str = None) -> Dict:
+
+    def find_oer_for_course(
+        self,
+        course_code: str,
+        term: str = None,
+        on_resource_evaluated: Optional[Callable[[Dict], None]] = None,
+    ) -> Dict:
         """
         Main method: Find and evaluate OER resources for a course
         
@@ -714,6 +1178,8 @@ class OERAgent:
         
         try:
             logger.info(f"Starting OER search for {course_code}")
+            if self.llm.provider == 'ollama' and not self.llm.is_ollama_reachable():
+                raise RuntimeError("OLLAMA_UNAVAILABLE")
             
             # Step 1: Get syllabus information (try Supabase first, fall back to live scraping)
             logger.info("Step 1: Fetching syllabus information...")
@@ -765,7 +1231,7 @@ class OERAgent:
             logger.info("Syllabus query variants for %s: %s", course_code, query_variants)
 
             primary_start = time.time()
-            primary_resources = self._search_primary_sources(query_variants, course_code)
+            primary_resources = self._search_primary_sources(query_variants, course_code, syllabus_context)
             logger.info(
                 "Primary scrapers found %s resources for %s variants in %.2fs",
                 len(primary_resources),
@@ -781,17 +1247,19 @@ class OERAgent:
                     len(primary_resources),
                     fallback_threshold,
                 )
-                fallback_resources = self._search_fallback_sources(query_variants, course_code)
+                fallback_resources = self._search_fallback_sources(query_variants, course_code, syllabus_context)
                 logger.info("Fallback sources returned %s resources", len(fallback_resources))
 
             all_resources = self._merge_resources(primary_resources, fallback_resources)
-            all_resources = all_resources[: int(self.config.MAX_TOTAL_CANDIDATES)]
             all_resources = [resource for resource in all_resources if not self._is_noise_resource(resource)]
 
             all_resources.sort(
                 key=lambda resource: self._candidate_prefilter_score(resource, syllabus_context, course_code),
                 reverse=True,
             )
+
+            selection_limit = min(int(self.config.MAX_TOTAL_CANDIDATES), self.demo_max_oer_per_search)
+            all_resources = self._balance_primary_source_mix(all_resources, selection_limit)
 
             if not all_resources:
                 logger.warning(f"No scraper resources found across platforms for {course_code}; trying LLM suggestions")
@@ -829,7 +1297,7 @@ class OERAgent:
                     'relevance_explanation': f'Scraper-discovered resource for {course_code}',
                     'identified_by': 'scraper'
                 }
-                for resource in all_resources[: int(self.config.MAX_PRIMARY_CANDIDATES)]
+                for resource in all_resources[: min(int(self.config.MAX_PRIMARY_CANDIDATES), self.demo_max_oer_per_search)]
             ]
             
             # Step 4: Evaluate each identified resource
@@ -842,8 +1310,8 @@ class OERAgent:
             if not identified_resources:
                 logger.error("ERROR: No identified_resources to evaluate! This should not happen.")
             
-            max_relevance = int(self.config.MAX_RELEVANCE_EVALUATIONS)
-            max_evaluated = int(self.config.MAX_EVALUATED_RESOURCES)
+            max_relevance = min(int(self.config.MAX_RELEVANCE_EVALUATIONS), self.demo_max_oer_per_search)
+            max_evaluated = min(int(self.config.MAX_EVALUATED_RESOURCES), self.demo_max_oer_per_search)
             for idx, identified in enumerate(identified_resources[:max_evaluated]):
                 try:
                     logger.info(f"Processing resource {idx+1}/{len(identified_resources)}")
@@ -954,6 +1422,12 @@ class OERAgent:
                     }
                     
                     evaluated_resources.append(evaluated_resource)
+                    if on_resource_evaluated:
+                        on_resource_evaluated({
+                            'evaluated_resource': evaluated_resource,
+                            'evaluated_count': len(evaluated_resources),
+                            'total_candidates': min(len(identified_resources), max_evaluated),
+                        })
                     logger.info(f"Successfully evaluated resource {idx+1}: {resource.get('title', 'Unknown')}")
                     
                 except Exception as e:
@@ -994,6 +1468,12 @@ class OERAgent:
                                 'integration_guidance': f'Resource URL: {resource.get("url", "N/A")}\nNote: Full evaluation could not be completed.'
                             }
                             evaluated_resources.append(minimal_resource)
+                            if on_resource_evaluated:
+                                on_resource_evaluated({
+                                    'evaluated_resource': minimal_resource,
+                                    'evaluated_count': len(evaluated_resources),
+                                    'total_candidates': min(len(identified_resources), max_evaluated),
+                                })
                             logger.info(f"Added resource {idx+1} with minimal evaluation: {resource.get('title', 'Unknown')}")
                     except Exception as e2:
                         logger.error(f"Failed to add resource even with minimal evaluation: {e2}")

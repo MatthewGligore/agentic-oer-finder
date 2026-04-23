@@ -14,6 +14,7 @@ class SupabaseClient:
     
     def __init__(self):
         """Initialize Supabase client with credentials from config"""
+        self._saved_resources_available = True
         if not Config.USE_SUPABASE:
             logger.warning("Supabase credentials not configured. Database operations will be unavailable.")
             self.client: Optional[Client] = None
@@ -321,6 +322,70 @@ class SupabaseClient:
         except Exception as e:
             logger.error(f"Error searching syllabuses: {e}")
             return []
+
+    # ===== SAVED RESOURCES TABLE OPERATIONS =====
+
+    def list_saved_resources(self, course_code: Optional[str] = None) -> List[Dict[str, Any]]:
+        """List saved resources, optionally filtered by course code."""
+        if not self.is_available():
+            return []
+        if not self._saved_resources_available:
+            return []
+        try:
+            query = self.client.table('saved_resources').select('*').order('created_at', desc=True)
+            if course_code:
+                query = query.eq('course_code', course_code)
+            response = query.execute()
+            return response.data or []
+        except Exception as e:
+            if self._is_missing_saved_resources_table(e):
+                self._saved_resources_available = False
+                logger.warning("saved_resources table is unavailable; continuing without saved-resource state")
+                return []
+            logger.error(f"Error listing saved resources: {e}")
+            return []
+
+    def upsert_saved_resource(self, row: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        """Insert or update a saved resource by (course_code, resource_url)."""
+        if not self.is_available():
+            return None
+        if not self._saved_resources_available:
+            return None
+        try:
+            response = self.client.table('saved_resources').upsert(
+                row,
+                on_conflict='course_code,resource_url',
+            ).execute()
+            return response.data[0] if response.data else None
+        except Exception as e:
+            if self._is_missing_saved_resources_table(e):
+                self._saved_resources_available = False
+                logger.warning("saved_resources table is unavailable; skipping save request")
+                return None
+            logger.error(f"Error upserting saved resource: {e}")
+            return None
+
+    def delete_saved_resource(self, resource_id: str) -> bool:
+        """Delete saved resource by id."""
+        if not self.is_available():
+            return False
+        if not self._saved_resources_available:
+            return False
+        try:
+            response = self.client.table('saved_resources').delete().eq('id', resource_id).execute()
+            return bool(response.data)
+        except Exception as e:
+            if self._is_missing_saved_resources_table(e):
+                self._saved_resources_available = False
+                logger.warning("saved_resources table is unavailable; skipping delete request")
+                return False
+            logger.error(f"Error deleting saved resource {resource_id}: {e}")
+            return False
+
+    def _is_missing_saved_resources_table(self, exc: Exception) -> bool:
+        """Detect Supabase schema-cache errors for optional saved_resources support."""
+        text = str(exc)
+        return 'PGRST205' in text or "saved_resources" in text and 'schema cache' in text.lower()
 
 
 # Singleton instance

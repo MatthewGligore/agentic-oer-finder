@@ -5,10 +5,11 @@ import { useAppState } from '../context/AppState'
 function HomePage() {
   const navigate = useNavigate()
   const {
+    analysisDetail,
     analysisProgress,
+    analysisStage,
     courseCode,
     error,
-    featuredResource,
     isLoading,
     missingSyllabus,
     normalizedResources,
@@ -17,10 +18,16 @@ function HomePage() {
     setCourseCode,
     setTerm,
     term,
+    toggleSavedResource,
   } = useAppState()
 
   const resourceCount = normalizedResources.length
-  const hasResults = Boolean(results)
+  const hasResults = normalizedResources.length > 0
+  const scoreAverage = hasResults
+    ? (
+      normalizedResources.reduce((total, item) => total + Number(item.finalRankScore || 0), 0) / resourceCount
+    ).toFixed(2)
+    : '0.00'
 
   const handleSubmit = async (event) => {
     event.preventDefault()
@@ -29,21 +36,35 @@ function HomePage() {
 
   const quickCourses = ['ENGL 1101', 'ITEC 1001', 'HIST 2111', 'BIOL 1101K']
 
+  const topCriteria = (criteriaScores = {}) => (
+    Object.entries(criteriaScores)
+      .map(([name, value]) => ({ name, score: Number(value || 0) }))
+      .sort((a, b) => b.score - a.score)
+      .slice(0, 4)
+  )
+
+  const scoreBand = (score) => {
+    if (score >= 4.3) return 'excellent'
+    if (score >= 3.4) return 'strong'
+    if (score >= 2.4) return 'fair'
+    return 'weak'
+  }
+
   return (
     <main className="canvas dashboard-page">
       <section className="panel dashboard-hero">
         <div className="dashboard-hero-copy">
           <p className="eyebrow">Agentic OER Finder</p>
-          <h1>Search OER from a dashboard that keeps the workflow in view.</h1>
+          <h1>Discover high-fit OER in one guided workflow.</h1>
           <p className="lead-copy">
-            Start with a course code, track syllabus analysis in real time, and review the best-fit open resources without leaving the page.
+            Production-ready discovery console for faculty support teams: scrape, score, rank, and hand off recommendations with confidence.
           </p>
 
           <div className="dashboard-stats">
             <article className="stat-card">
               <span className="stat-label">Analysis</span>
               <strong>{analysisProgress}%</strong>
-              <span className="stat-note">Pipeline progress</span>
+              <span className="stat-note">{analysisStage}</span>
             </article>
 
             <article className="stat-card">
@@ -53,9 +74,9 @@ function HomePage() {
             </article>
 
             <article className="stat-card">
-              <span className="stat-label">Syllabus source</span>
-              <strong>{results?.syllabus_info?.from_database ? 'Supabase' : 'Live scrape'}</strong>
-              <span className="stat-note">Latest lookup path</span>
+              <span className="stat-label">Avg score</span>
+              <strong>{scoreAverage} / 5</strong>
+              <span className="stat-note">Current recommendation quality</span>
             </article>
           </div>
 
@@ -70,21 +91,24 @@ function HomePage() {
 
         <aside className="pipeline-card" aria-live="polite">
           <p className="eyebrow">Discovery pipeline</p>
-          <h2>{isLoading ? 'Analyzing resources' : 'Ready to search'}</h2>
-          <p>
-            {isLoading
-              ? 'Running syllabus checks, source discovery, and rubric scoring.'
-              : 'Enter a course code to start ranking open resources.'}
-          </p>
+          <h2>{isLoading ? analysisStage : hasResults ? 'Search complete' : 'Ready to search'}</h2>
+          <p>{isLoading ? analysisDetail : hasResults ? 'Ranked resources are ready for review and bookmarking.' : 'Enter a course code to start discovery.'}</p>
           <div className="analysis-meter" role="progressbar" aria-valuenow={analysisProgress} aria-valuemin={0} aria-valuemax={100}>
             <div className="analysis-meter-fill" style={{ width: `${analysisProgress}%` }} />
           </div>
+          <p className="pipeline-stage-note">{analysisDetail}</p>
           <div className="pipeline-footer">
             <span>{analysisProgress}% complete</span>
-            <button type="button" className="secondary-action" onClick={() => navigate('/results')} disabled={!hasResults}>
-              Open Results
+            <button type="button" className="secondary-action" onClick={() => navigate('/saved')}>
+              Open Saved
             </button>
           </div>
+          {isLoading && (
+            <div className="loading-inline">
+              <span className="spinner" />
+              <span>Running scraping and rubric evaluation...</span>
+            </div>
+          )}
         </aside>
       </section>
 
@@ -92,10 +116,10 @@ function HomePage() {
         <div className="section-heading">
           <div>
             <p className="eyebrow">Course search</p>
-            <h2>Find OER resources</h2>
-            <p className="muted-copy">Search by course code and optional term. The dashboard updates as soon as the analysis finishes.</p>
+            <h2>Search course resources</h2>
+            <p className="muted-copy">Use course code and optional term to run a full scrape and evaluation cycle.</p>
           </div>
-          <span className="result-badge">{resourceCount ? `${resourceCount} ranked` : 'Waiting for search'}</span>
+          <span className="result-badge">{resourceCount ? `${resourceCount} ranked` : 'No results yet'}</span>
         </div>
 
         <form className="dashboard-search" onSubmit={handleSubmit}>
@@ -114,15 +138,15 @@ function HomePage() {
             disabled={isLoading}
           />
           <button type="submit" disabled={isLoading || !courseCode.trim()}>
-            {isLoading ? 'Searching...' : 'Search OER'}
+            {isLoading ? 'Searching...' : 'Run intelligent search'}
           </button>
         </form>
 
-        {error && <p className="error-banner">{error}</p>}
+        {error && <p className="error-banner" role="alert">{error}</p>}
 
         {missingSyllabus && (
           <div className="empty-results-card" style={{ marginTop: '1rem', textAlign: 'left' }}>
-            <p className="empty-results-title">No syllabus found in Supabase for {missingSyllabus.courseCode}</p>
+            <p className="empty-results-title">Syllabus missing for {missingSyllabus.courseCode}</p>
             <p>{missingSyllabus.message}</p>
             <div className="action-row" style={{ marginTop: '0.6rem' }}>
               <button
@@ -141,78 +165,118 @@ function HomePage() {
         <div className="section-heading">
           <div>
             <p className="eyebrow">Results</p>
-            <h2>{results ? `Results for ${results.course_code}` : 'Search to populate the dashboard'}</h2>
+            <h2>{results ? `Results for ${results.course_code}` : 'Search to populate results'}</h2>
             <p className="muted-copy">
               {results
-                ? 'The strongest match is highlighted first, with the remaining resources arranged in a quick scan grid.'
-                : 'Your search results will appear here, including scores, licenses, and source links.'}
+                ? 'Each card includes rank, score, rationale, rubric snapshot, and save controls.'
+                : 'Ranked resources will appear here after search.'}
             </p>
           </div>
-
-          {hasResults && (
-            <button type="button" className="primary-action" onClick={() => navigate('/results')}>
-              View Full Results
-            </button>
-          )}
         </div>
 
-        {hasResults ? (
-          <>
-            {featuredResource && (
-              <article className="featured-resource-card">
-                <div className="featured-resource-copy">
-                  <p className="tiny-tag">Primary match</p>
-                  <h3>{featuredResource.title}</h3>
-                  <p>{featuredResource.description}</p>
-
-                  <div className="meta-row">
-                    <span>{featuredResource.license}</span>
-                    <span>Final score {featuredResource.finalRankScore.toFixed(1)} / 5</span>
-                  </div>
-
-                  <div className="action-row">
-                    <a href={featuredResource.url} target="_blank" rel="noopener noreferrer">
-                      Open resource
-                    </a>
-                    {featuredResource.sourceSearchUrl && (
-                      <a href={featuredResource.sourceSearchUrl} target="_blank" rel="noopener noreferrer">
-                        Browse source
-                      </a>
-                    )}
-                  </div>
-                </div>
+        {isLoading && !hasResults ? (
+          <div className="resource-card-grid single-column">
+            {[1, 2, 3].map((card) => (
+              <article key={card} className="resource-card skeleton-card">
+                <div className="skeleton skeleton-title" />
+                <div className="skeleton skeleton-line" />
+                <div className="skeleton skeleton-line short" />
+                <div className="skeleton skeleton-line" />
               </article>
-            )}
-
-            <div className="resource-card-grid">
-              {normalizedResources.slice(1).map((resource) => (
-                <article key={resource.id} className="resource-card">
+            ))}
+          </div>
+        ) : hasResults ? (
+          <div className="resource-card-grid" style={{ gridTemplateColumns: '1fr' }}>
+            {normalizedResources.map((resource) => (
+              <article key={resource.id} className={`resource-card resource-card-rich score-${scoreBand(resource.finalRankScore)}`}>
+                <div className="card-section card-header-section">
                   <div className="resource-card-head">
-                    <h3>{resource.title}</h3>
-                    <span className="score-chip">{resource.finalRankScore.toFixed(1)} / 5</span>
+                    <div className="resource-icon-square">
+                      <img src={resource.thumbnailUrl} alt={`${resource.title} icon`} loading="lazy" />
+                      <span className="material-symbols-outlined">{resource.visualType}</span>
+                    </div>
+                    <div className="resource-heading-copy">
+                      <p className="rank-pill">Rank #{resource.rank}</p>
+                      <h3>{resource.title}</h3>
+                      <p className="resource-domain">{resource.hostname}</p>
+                    </div>
                   </div>
+                  <span className="score-chip score-chip-large">{resource.finalRankScore.toFixed(2)} / 5</span>
+                </div>
 
+                <div className="card-section card-body-section">
                   <p>{resource.description}</p>
-
+                  <p><strong>Why ranked here:</strong> {resource.reasoningSummary}</p>
                   <div className="meta-row compact">
                     <span>{resource.license}</span>
                     <span>{resource.source}</span>
-                    <span>{resource.sourceTier}</span>
                   </div>
+                </div>
 
-                  <a href={resource.url} target="_blank" rel="noopener noreferrer">
-                    Open resource
-                  </a>
-                </article>
-              ))}
-            </div>
-          </>
+                <div className="card-section card-rubric-section">
+                  <p className="rubric-title">Rubric highlights</p>
+                  <div className="rubric-strip">
+                    {topCriteria(resource.criteriaScores).map(({ name, score }) => (
+                      <div key={name} className="rubric-row">
+                        <div className="rubric-row-head">
+                          <span>{name.replaceAll('_', ' ')}</span>
+                          <strong>{score.toFixed(1)} / 5</strong>
+                        </div>
+                        <div className="rubric-bar">
+                          <div style={{ width: `${Math.min(100, Math.max(0, (score / 5) * 100))}%` }} />
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+
+                <div className="card-section card-footer-section">
+                  <div className="action-row">
+                    <a href={resource.url} target="_blank" rel="noopener noreferrer">
+                      Open resource
+                    </a>
+                    <button
+                      type="button"
+                      className="secondary-action"
+                      onClick={() => toggleSavedResource(resource)}
+                    >
+                      {resource.saved ? 'Unsave' : 'Save to library'}
+                    </button>
+                  </div>
+                </div>
+              </article>
+            ))}
+          </div>
         ) : (
           <div className="empty-results-card">
-            <p className="empty-results-title">No search has been run yet.</p>
-            <p>Enter a course code above to bring back the dashboard-style workflow.</p>
+            <p className="empty-results-title">No ranked results yet.</p>
+            <p>Run an intelligent search above to start resource discovery.</p>
           </div>
         )}
+      </section>
+
+      <section className="panel dashboard-info-grid">
+        <article className="feature-card">
+          <span className="material-symbols-outlined">speed</span>
+          <div>
+            <h3>Fast execution loop</h3>
+            <p>Searches stream from scrape to rank with visible progress and clear status indicators.</p>
+          </div>
+        </article>
+        <article className="feature-card">
+          <span className="material-symbols-outlined">verified</span>
+          <div>
+            <h3>Transparent scoring</h3>
+            <p>Each recommendation includes rationale and criterion-level signal for review confidence.</p>
+          </div>
+        </article>
+        <article className="feature-card">
+          <span className="material-symbols-outlined">dashboard</span>
+          <div>
+            <h3>Team-ready dashboard</h3>
+            <p>Responsive interface with dark-mode ergonomics for long review and curation sessions.</p>
+          </div>
+        </article>
       </section>
     </main>
   )

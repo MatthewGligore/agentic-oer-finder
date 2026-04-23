@@ -1,38 +1,31 @@
 # Agentic OER Finder
 
-Agentic OER Finder helps faculty discover open educational resources by course code, then ranks results with rubric and license checks.
+Agentic OER Finder is a demo-ready discovery platform that helps faculty locate open educational resources (OER) by course code and returns ranked results with license and rubric-informed scoring.
 
-## Documentation Index
+## Release Overview
 
-| Doc | Purpose |
-|---|---|
-| [README.md](README.md) | Main quick start and project overview |
-| [ARCHITECTURE.md](ARCHITECTURE.md) | System design and runtime flow |
-| [DEMO_CHECKLIST.md](DEMO_CHECKLIST.md) | Live demo prep and fallback steps |
-| [DEPLOYMENT.md](DEPLOYMENT.md) | Local and hosted deployment patterns |
-| [SUPABASE_SETUP.md](SUPABASE_SETUP.md) | Optional Supabase setup and seeding |
-| [backend/README.md](backend/README.md) | Backend API and CLI guide |
-| [frontend/README.md](frontend/README.md) | Frontend run/build guide |
-| [docs/archive/README.md](docs/archive/README.md) | Archived planning and phase docs |
+- **Frontend:** React + Vite, served at `http://localhost:3000`
+- **Backend:** Flask API, served at `http://localhost:8000`
+- **Default runtime mode:** `no_api` (works without external LLM keys)
+- **Optional enhancement:** Supabase-backed syllabus context for stronger relevance
 
-## Polished Demo State
+## Key Capabilities
 
-- Frontend: React + Vite on `http://localhost:3000`
-- Backend: Flask API on `http://localhost:8000`
-- Default mode: `no_api` (works without OpenAI/Anthropic keys)
-- Optional: Supabase-backed syllabus context for stronger relevance
+- Search OER resources by course code and academic term
+- Rank and enrich results using evaluation and licensing checks
+- Provide a clean API surface for UI and integration workflows
+- Support local demo execution with optional cloud data enrichment
 
 ## Quick Start
 
 ### Prerequisites
 
 - Node.js 18+
-- Python 3.10-3.13 (recommended)
+- Python 3.10-3.13
 
-### 1) Install Dependencies
+### 1) Install dependencies
 
 ```bash
-# from repo root
 python3 -m venv .venv
 source .venv/bin/activate
 pip install -r backend/requirements.txt
@@ -42,15 +35,15 @@ npm install
 cd ..
 ```
 
-### 2) Configure Environment
+### 2) Configure environment
 
 ```bash
 cp .env.example .env
 ```
 
-The app runs in local `no_api` mode by default. Supabase is optional.
+The application is configured to run locally in `no_api` mode by default.
 
-### 3) Run the App
+### 3) Start services
 
 ```bash
 # terminal 1 (repo root)
@@ -64,19 +57,26 @@ cd frontend
 npm run dev
 ```
 
-Open `http://localhost:3000`.
+Open `http://localhost:3000` to access the interface.
 
-## Demo Flow
+## Optional Supabase Integration
 
-1. Search a course code such as `ENGL 1101` or `ITEC 1001`.
-2. Review ranked resources and license information.
-3. Open a resource link and show integration guidance.
+1. Create a Supabase project.
+2. Add the following values to `.env`:
+   - `SUPABASE_URL`
+   - `SUPABASE_ANON_KEY`
+   - `SUPABASE_SERVICE_ROLE_KEY`
+3. Run `backend/schema.sql` in the Supabase SQL editor.
+4. (Optional) Seed syllabus data:
 
-See `DEMO_CHECKLIST.md` for a ready-to-run presenter checklist.
+```bash
+source .venv/bin/activate
+python -m backend.cli scrape-syllabuses --limit 10
+```
 
-## API Quick Reference
+## API Reference
 
-### Health
+### Health Check
 
 ```http
 GET /api/health
@@ -96,31 +96,22 @@ Content-Type: application/json
 }
 ```
 
-## Core Documentation
+### Stats
 
-- `ARCHITECTURE.md` - current system architecture
-- `DEMO_CHECKLIST.md` - presentation and smoke-test checklist
-- `DEPLOYMENT.md` - local and hosted deployment options
-- `SUPABASE_SETUP.md` - optional Supabase setup
-- `backend/README.md` - backend API and service details
-- `frontend/README.md` - frontend details and build notes
-- `docs/archive/README.md` - archived planning and phase docs
+```http
+GET /api/stats
+```
 
-## Archived Docs
+## Developer Commands
 
-Legacy phase/planning docs were moved from the repository root into `docs/archive/` to keep the polished demo surface clean.
+```bash
+python -m backend.cli search --course "ENGL 1101"
+python -m backend.cli scrape-syllabuses --limit 10
+python -m pytest backend/tests/test_api_contracts.py
+python -m pytest backend/tests/test_oer_agent_search_profile.py
+```
 
 ## Troubleshooting
 
-### Frontend cannot reach backend
-
-- Confirm backend is running on `http://localhost:8000`.
-- Confirm `frontend/vite.config.js` proxy target is `http://localhost:8000`.
-
-### Port conflict
-
-```bash
-PORT=9000 python run.py
-```
-
-Then update the frontend proxy target to the same port.
+- **Frontend cannot reach backend:** confirm backend is running at `http://localhost:8000` and frontend proxy target points to that URL.
+- **Port conflict:** run backend on a different port, for example `PORT=9000 python run.py`, and update frontend proxy settings to match.

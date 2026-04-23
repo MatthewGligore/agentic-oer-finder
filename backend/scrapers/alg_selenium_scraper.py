@@ -15,6 +15,9 @@ class ALGSeleniumScraper:
     """Dedicated Selenium scraper for ALG search."""
 
     BASE_URL = 'https://alg.manifoldapp.org'
+    PROJECT_SEARCH_URL = (
+        'https://alg.manifoldapp.org/projects/all?keyword={query}&page=1&standaloneModeEnforced=false'
+    )
     SEARCH_URL = 'https://alg.manifoldapp.org/search?q={query}'
 
     def __init__(self, timeout_seconds: int = 12) -> None:
@@ -25,12 +28,17 @@ class ALGSeleniumScraper:
         if not query_text:
             return []
 
-        search_url = self.SEARCH_URL.format(query=quote_plus(query_text))
-        html = self._fetch_with_selenium(search_url)
-        if not html:
-            return []
+        # Prefer the same endpoint used by interactive "All Projects" search.
+        for url_template in (self.PROJECT_SEARCH_URL, self.SEARCH_URL):
+            search_url = url_template.format(query=quote_plus(query_text))
+            html = self._fetch_with_selenium(search_url)
+            if not html:
+                continue
+            parsed = self._parse_search_results(html, search_url, query_text)
+            if parsed:
+                return parsed
 
-        return self._parse_search_results(html, search_url, query_text)
+        return []
 
     def _fetch_with_selenium(self, url: str) -> Optional[str]:
         try:
@@ -58,6 +66,13 @@ class ALGSeleniumScraper:
             WebDriverWait(driver, self.timeout_seconds).until(
                 EC.presence_of_element_located((By.TAG_NAME, 'body'))
             )
+            # Wait briefly for project cards/links to render in JS-driven views.
+            try:
+                WebDriverWait(driver, min(self.timeout_seconds, 6)).until(
+                    EC.presence_of_element_located((By.CSS_SELECTOR, 'a[href*="/projects/"]'))
+                )
+            except Exception:
+                pass
             return driver.page_source
         except Exception as exc:
             logger.info("ALG Selenium request failed for %s: %s", url, exc)
@@ -70,6 +85,7 @@ class ALGSeleniumScraper:
         soup = BeautifulSoup(html, 'html.parser')
         resources: List[Dict] = []
         seen = set()
+        query_tokens = {token.lower() for token in query_text.split() if token.strip()}
 
         for link in soup.find_all('a', href=True):
             href = (link.get('href') or '').strip()
@@ -87,11 +103,17 @@ class ALGSeleniumScraper:
             if any(skip in full_url.lower() for skip in ['/projects/all', '/project-collection']):
                 continue
 
+            context_text = self._clean_text(link.parent.get_text(' ', strip=True) if link.parent else '')
+            relevance_text = f"{text} {context_text}".lower()
+            # Keep links that carry at least one query token in visible card context.
+            if query_tokens and not any(token in relevance_text for token in query_tokens):
+                continue
+
             seen.add(full_url)
             resources.append({
                 'title': text[:180],
                 'url': full_url,
-                'description': f'ALG library result for {query_text}.',
+                'description': context_text[:300] or 'Open ALG Library project page.',
                 'author': 'Open ALG Library',
                 'license': 'Varies',
                 'source': 'Open ALG Library',

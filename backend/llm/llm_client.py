@@ -197,12 +197,18 @@ class LLMClient:
         
         except Exception as e:
             logger.error(f"Error generating response: {e}")
-            if self.client == 'ollama':
-                message = str(e).lower()
-                if 'connection refused' in message or 'failed to establish' in message:
-                    logger.warning("Ollama is unreachable; switching to no-API fallback mode for this session.")
-                    self.client = 'no-api'
             return None
+
+    def is_ollama_reachable(self) -> bool:
+        """Check if local Ollama endpoint is reachable."""
+        if self.client != 'ollama':
+            return True
+        base_url = os.getenv('OLLAMA_BASE_URL', 'http://localhost:11434').rstrip('/')
+        try:
+            response = requests.get(f"{base_url}/api/tags", timeout=4)
+            return response.ok
+        except Exception:
+            return False
     
     def identify_oer_resources(self, syllabus_info: Dict, alg_resources: List[Dict]) -> List[Dict]:
         """
@@ -407,6 +413,7 @@ Score this resource for syllabus fit on a 1-5 scale.
         title = (resource or {}).get('title', '')
         url = (resource or {}).get('url', '')
         description = (resource or {}).get('description', '')
+        search_profile = (syllabus_context or {}).get('search_profile', {}) or {}
 
         # Ignore synthetic scraper blurbs that mirror the query and can create false positives.
         synthetic = 'candidate resource from' in str(description).lower() or 'search for' in str(title).lower()
@@ -419,9 +426,27 @@ Score this resource for syllabus fit on a 1-5 scale.
                 'rationale': 'Generic source search listing; down-ranked against direct resource pages.',
             }
 
+        if any(
+            phrase in f"{title} {description}".lower()
+            for phrase in [
+                'research grant',
+                'research report',
+                'adoption of',
+                'standard operating procedures',
+                'kick-off training',
+                'promotion and tenure',
+            ]
+        ):
+            return {
+                'score': 1.0,
+                'matched_topics': [],
+                'rationale': 'Program or administrative resource; down-ranked against direct course materials.',
+            }
+
         topic_terms = [str(t).strip().lower() for t in (syllabus_context or {}).get('topics', []) if str(t).strip()]
         objective_terms = [str(t).strip().lower() for t in (syllabus_context or {}).get('objectives', []) if str(t).strip()]
-        terms = list(dict.fromkeys(topic_terms + objective_terms))[:25]
+        profile_terms = [str(t).strip().lower() for t in search_profile.get('required_terms', []) if str(t).strip()]
+        terms = list(dict.fromkeys(profile_terms + topic_terms + objective_terms))[:25]
 
         if not terms:
             return {'score': 3.0, 'matched_topics': [], 'rationale': 'No syllabus topics/objectives available for relevance scoring.'}
@@ -429,6 +454,16 @@ Score this resource for syllabus fit on a 1-5 scale.
         matched = [term for term in terms if term in text]
         ratio = len(matched) / max(1, min(len(terms), 12))
         score = 1.0 + (4.0 * min(1.0, ratio))
+
+        if search_profile.get('strict_matching'):
+            preferred_phrase_match = any(
+                phrase.lower() in text
+                for phrase in search_profile.get('preferred_queries', [])
+                if phrase
+            )
+            required_matches = sum(1 for term in profile_terms if term in text)
+            if not preferred_phrase_match and required_matches < 2:
+                score = min(score, 1.6)
 
         url_lower = str(url).lower()
         if any(token in url_lower for token in ['/merlot/viewmaterial', 'materials.htm?materialid=', '/projects/', '/courseware/']):

@@ -37,6 +37,25 @@ CREATE TABLE IF NOT EXISTS syllabus_sections (
 CREATE INDEX IF NOT EXISTS idx_sections_syllabus_id ON syllabus_sections(syllabus_id);
 CREATE INDEX IF NOT EXISTS idx_sections_type ON syllabus_sections(section_type);
 
+-- Saved resource snapshots for demo bookmarking.
+CREATE TABLE IF NOT EXISTS saved_resources (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  course_code TEXT NOT NULL,
+  resource_url TEXT NOT NULL,
+  title TEXT NOT NULL,
+  description TEXT,
+  source TEXT,
+  license TEXT,
+  final_rank_score NUMERIC,
+  reasoning_summary TEXT,
+  evaluation_payload JSONB DEFAULT '{}'::jsonb,
+  created_at TIMESTAMP WITH TIME ZONE DEFAULT now(),
+  updated_at TIMESTAMP WITH TIME ZONE DEFAULT now(),
+  UNIQUE(course_code, resource_url)
+);
+
+CREATE INDEX IF NOT EXISTS idx_saved_resources_course_code ON saved_resources(course_code);
+
 -- Enable Full Text Search on section content (optional, for advanced search)
 ALTER TABLE syllabus_sections ADD COLUMN IF NOT EXISTS search_vector tsvector GENERATED ALWAYS AS (
   to_tsvector('english', COALESCE(section_title, '') || ' ' || COALESCE(section_content, ''))

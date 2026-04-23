@@ -6,6 +6,12 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
+
+def _parse_csv_env(name: str, default: str) -> list[str]:
+    """Parse comma-separated env values into a clean list."""
+    value = os.getenv(name, default)
+    return [item.strip() for item in value.split(',') if item.strip()]
+
 class Config:
     """Application configuration"""
     
@@ -22,8 +28,8 @@ class Config:
         DEFAULT_MODEL = env_model
     
     # Data Sources
-    SYLLABUS_BASE_URL = 'https://ggc.simplesyllabus.com'
-    ALG_BASE_URL = 'https://alg.manifoldapp.org'
+    SYLLABUS_BASE_URL = os.getenv('SYLLABUS_BASE_URL', 'https://ggc.simplesyllabus.com').rstrip('/')
+    ALG_BASE_URL = os.getenv('ALG_BASE_URL', 'https://alg.manifoldapp.org').rstrip('/')
     
     # Logging
     LOG_LEVEL = os.getenv('LOG_LEVEL', 'INFO')
@@ -32,6 +38,10 @@ class Config:
     # Application
     DEBUG = os.getenv('DEBUG', 'False').lower() == 'true'
     PORT = int(os.getenv('PORT', 8000))
+    CORS_ALLOWED_ORIGINS = _parse_csv_env(
+        'CORS_ALLOWED_ORIGINS',
+        'http://localhost:3000,http://localhost:8000,http://127.0.0.1:3000,http://127.0.0.1:8000'
+    )
     
     # Supabase Configuration
     SUPABASE_URL = os.getenv('SUPABASE_URL', '')
@@ -77,6 +87,7 @@ class Config:
     MAX_TOTAL_CANDIDATES = int(os.getenv('MAX_TOTAL_CANDIDATES', '30'))
     MAX_RELEVANCE_EVALUATIONS = int(os.getenv('MAX_RELEVANCE_EVALUATIONS', '12'))
     MAX_EVALUATED_RESOURCES = int(os.getenv('MAX_EVALUATED_RESOURCES', '15'))
+    MAX_LLM_EVALUATIONS = int(os.getenv('MAX_LLM_EVALUATIONS', '3'))
 
     # Syllabus-derived query generation
     MAX_SYLLABUS_QUERY_VARIANTS = int(os.getenv('MAX_SYLLABUS_QUERY_VARIANTS', '5'))
