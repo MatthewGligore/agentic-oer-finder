@@ -62,17 +62,33 @@ Open `http://localhost:3000` to access the interface.
 ## Optional Supabase Integration
 
 1. Create a Supabase project.
-2. Add the following values to `.env`:
+2. Add the following values to **backend / repo `.env`** (used by Flask):
    - `SUPABASE_URL`
    - `SUPABASE_ANON_KEY`
    - `SUPABASE_SERVICE_ROLE_KEY`
-3. Run `backend/schema.sql` in the Supabase SQL editor.
-4. (Optional) Seed syllabus data:
+   - `SUPABASE_JWT_SECRET` — **JWT Secret** from Supabase **Project Settings → API** (required to verify signed-in users from the frontend).
+3. Run `backend/schema.sql` in the Supabase SQL editor (includes `saved_resources` per-user rows, `query_term_stats`, RLS on bookmarks, and telemetry columns).
+4. **Enable Auth:** In Supabase **Authentication → Providers**, enable **Email** (password sign-up/sign-in).
+5. Add **frontend** env vars (e.g. `frontend/.env.local`) — Vite only exposes variables prefixed with `VITE_`:
+   - `VITE_SUPABASE_URL` — same as `SUPABASE_URL`
+   - `VITE_SUPABASE_ANON_KEY` — same as `SUPABASE_ANON_KEY`
+
+When `VITE_SUPABASE_*` are unset, the UI runs in **guest mode**: search and disputes still work; saving resources opens **Sign in**. Without Supabase on the backend, saved resources remain unavailable.
+
+6. (Optional) Seed syllabus data:
 
 ```bash
 source .venv/bin/activate
 python -m backend.cli scrape-syllabuses --limit 10
 ```
+
+### Learning endpoints (feedback-driven ranking)
+
+- `POST /api/learning/train-reranker` — trains the logistic reranker from global feedback.
+- `POST /api/learning/mine-terms` — recomputes `query_term_stats` from impressions + feedback (improves syllabus query variants per subject).
+- `GET /api/learning/term-policy?subject=ENGL` — inspect mined term weights.
+
+Disputes and saves are stored **globally** (all users improve retrieval); **saved libraries are per user**.
 
 ## API Reference
 
@@ -102,6 +118,14 @@ Content-Type: application/json
 GET /api/stats
 ```
 
+### Auth (optional)
+
+```http
+GET /api/auth/me
+```
+
+Returns `{ "user": { "sub", "email" } | null }` depending on `Authorization: Bearer <Supabase access_token>`.
+
 ## Developer Commands
 
 ```bash
@@ -109,6 +133,7 @@ python -m backend.cli search --course "ENGL 1101"
 python -m backend.cli scrape-syllabuses --limit 10
 python -m pytest backend/tests/test_api_contracts.py
 python -m pytest backend/tests/test_oer_agent_search_profile.py
+python -m pytest backend/tests/test_term_miner.py
 ```
 
 ## Troubleshooting

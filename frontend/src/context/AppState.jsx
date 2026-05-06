@@ -1,9 +1,23 @@
 import React, { createContext, useCallback, useContext, useEffect, useMemo, useState } from 'react'
+import { useNavigate } from 'react-router-dom'
+import { useAuth } from './AuthContext'
+import { isSupabaseConfigured } from '../lib/supabaseClient'
 import oerAPI from '../services/oerAPI'
 
 const AppStateContext = createContext(null)
+const RUBRIC_CRITERIA = [
+  'Open License',
+  'Content Quality',
+  'Accessibility',
+  'Relevance to Course',
+  'Currency/Up-to-date',
+  'Pedagogical Value',
+  'Technical Quality',
+]
 
 export function AppStateProvider({ children }) {
+  const navigate = useNavigate()
+  const { user } = useAuth()
   const [courseCode, setCourseCode] = useState('')
   const [term, setTerm] = useState('')
   const [isLoading, setIsLoading] = useState(false)
@@ -118,8 +132,19 @@ export function AppStateProvider({ children }) {
         || item.evaluation_payload?.thumbnail_url
         || item.evaluation_payload?.image_url
 
+      const rawScores = item.criteria_scores || {}
+      const rawExplanations = item.criteria_explanations || {}
+      const criteriaScores = {}
+      const criteriaExplanations = {}
+      RUBRIC_CRITERIA.forEach((criterion) => {
+        criteriaScores[criterion] = Number(rawScores[criterion] ?? 0)
+        criteriaExplanations[criterion] = rawExplanations[criterion] || 'No explanation available.'
+      })
+
       return {
         id: item.id || item.resource_url || `${index}-${item.title || 'resource'}`,
+        resultId: item.result_id || `${index}-${item.resource_url || 'result'}`,
+        searchSessionId: item.search_session_id || results?.search_session_id || null,
         rank: item.rank || index + 1,
         title: item.title || 'Untitled Resource',
         url: resourceUrl,
@@ -128,8 +153,8 @@ export function AppStateProvider({ children }) {
         source: item.source || 'Unknown source',
         finalRankScore: Number(item.final_rank_score || 0),
         reasoningSummary: item.reasoning_summary || 'No ranking rationale available.',
-        criteriaScores: item.criteria_scores || {},
-        criteriaExplanations: item.criteria_explanations || {},
+        criteriaScores,
+        criteriaExplanations,
         evaluationPayload: item.evaluation_payload || {},
         hostname,
         visualType,
@@ -234,8 +259,16 @@ export function AppStateProvider({ children }) {
         setResults(streamComplete)
       }
 
-      const saved = await oerAPI.listSavedResources(code)
-      setSavedResources(saved.saved_resources || [])
+      if (isSupabaseConfigured() && user) {
+        try {
+          const saved = await oerAPI.listSavedResources(code)
+          setSavedResources(saved.saved_resources || [])
+        } catch {
+          setSavedResources([])
+        }
+      } else {
+        setSavedResources([])
+      }
       setAnalysisProgress(100)
       setAnalysisStage('Complete')
       setAnalysisDetail('Search complete. Ranked resources are ready.')
@@ -260,28 +293,69 @@ export function AppStateProvider({ children }) {
   }
 
   const refreshSavedResources = useCallback(async (code = '') => {
-    const payload = await oerAPI.listSavedResources(code)
-    setSavedResources(payload.saved_resources || [])
-  }, [])
+    if (isSupabaseConfigured() && !user) {
+      setSavedResources([])
+      return
+    }
+    try {
+      const payload = await oerAPI.listSavedResources(code)
+      setSavedResources(payload.saved_resources || [])
+    } catch {
+      setSavedResources([])
+    }
+  }, [user])
 
   const toggleSavedResource = async (resource) => {
-    if (resource.saved && resource.savedId) {
-      await oerAPI.deleteSavedResource(resource.savedId)
-    } else {
-      await oerAPI.saveResource({
-        course_code: courseCode,
-        resource_url: resource.url,
-        title: resource.title,
-        description: resource.description,
-        source: resource.source,
-        license: resource.license,
-        final_rank_score: resource.finalRankScore,
-        reasoning_summary: resource.reasoningSummary,
-        evaluation_payload: resource.evaluationPayload,
-      })
+    if (isSupabaseConfigured() && !user) {
+      navigate('/login')
+      return
     }
-    await refreshSavedResources(courseCode)
+    try {
+      if (resource.saved && resource.savedId) {
+        await oerAPI.deleteSavedResource(resource.savedId)
+      } else {
+        await oerAPI.saveResource({
+          course_code: courseCode,
+          resource_url: resource.url,
+          title: resource.title,
+          description: resource.description,
+          source: resource.source,
+          license: resource.license,
+          final_rank_score: resource.finalRankScore,
+          reasoning_summary: resource.reasoningSummary,
+          evaluation_payload: resource.evaluationPayload,
+        })
+        await oerAPI.postFeedbackEvent({
+          search_session_id: resource.searchSessionId,
+          result_id: resource.resultId,
+          event_type: 'save',
+          course_code: courseCode,
+          resource_url: resource.url,
+          metadata: { from: 'save_button' },
+        })
+      }
+      await refreshSavedResources(courseCode)
+    } catch (err) {
+      const message = err?.error || ''
+      if (message.toLowerCase().includes('authentication required')) {
+        navigate('/login')
+        return
+      }
+      throw err
+    }
   }
+
+  const logFeedbackEvent = useCallback(async (payload) => {
+    try {
+      await oerAPI.postFeedbackEvent(payload)
+    } catch (err) {
+      console.error('Feedback event failed:', err)
+    }
+  }, [])
+
+  const submitDispute = useCallback(async (payload) => {
+    return oerAPI.disputeRating(payload)
+  }, [])
 
   const value = {
     analysisProgress,
@@ -306,6 +380,8 @@ export function AppStateProvider({ children }) {
     searchResources,
     savedResources,
     refreshSavedResources,
+    logFeedbackEvent,
+    submitDispute,
     toggleSavedResource,
   }
 

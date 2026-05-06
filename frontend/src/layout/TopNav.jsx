@@ -1,9 +1,11 @@
 import React, { useState } from 'react'
-import { NavLink } from 'react-router-dom'
+import { Link, NavLink } from 'react-router-dom'
 import { useAppState } from '../context/AppState'
+import { useAuth } from '../context/AuthContext'
 
 function TopNav() {
   const { isDarkMode, setIsDarkMode } = useAppState()
+  const { user, status, supabaseConfigured, signOut } = useAuth()
   const [menuOpen, setMenuOpen] = useState(false)
 
   const navItems = [
@@ -43,7 +45,31 @@ function TopNav() {
         >
           <span className="material-symbols-outlined">{isDarkMode ? 'light_mode' : 'dark_mode'}</span>
         </button>
-        <div className="avatar-pill">Ops</div>
+        {!supabaseConfigured ? (
+          <span className="avatar-pill" title="Configure Supabase for accounts">
+            Guest mode
+          </span>
+        ) : status === 'loading' ? (
+          <span className="avatar-pill">…</span>
+        ) : user ? (
+          <>
+            <span className="avatar-pill" title={user.email || user.id}>
+              {user.email?.split('@')[0] || 'Signed in'}
+            </span>
+            <button type="button" className="icon-btn" onClick={() => signOut()} aria-label="Sign out">
+              <span className="material-symbols-outlined">logout</span>
+            </button>
+          </>
+        ) : (
+          <>
+            <Link className="top-link" to="/login">
+              Sign in
+            </Link>
+            <Link className="top-link" to="/register">
+              Register
+            </Link>
+          </>
+        )}
       </div>
 
       <nav className={`top-links-mobile ${menuOpen ? 'open' : ''}`}>
@@ -57,6 +83,16 @@ function TopNav() {
             {item.label}
           </NavLink>
         ))}
+        {!user && supabaseConfigured ? (
+          <>
+            <NavLink to="/login" className={({ isActive }) => `top-link ${isActive ? 'active' : ''}`} onClick={() => setMenuOpen(false)}>
+              Sign in
+            </NavLink>
+            <NavLink to="/register" className={({ isActive }) => `top-link ${isActive ? 'active' : ''}`} onClick={() => setMenuOpen(false)}>
+              Register
+            </NavLink>
+          </>
+        ) : null}
       </nav>
     </header>
   )

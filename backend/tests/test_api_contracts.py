@@ -13,6 +13,9 @@ class DummySupabase:
     def __init__(self):
         self.saved = []
         self.syllabuses = []
+        self.sessions = []
+        self.impressions = []
+        self.feedback = []
 
     def is_available(self):
         return True
@@ -29,13 +32,26 @@ class DummySupabase:
     def fetch_syllabuses_by_course_code(self, _course_code, _term=None):
         return self.syllabuses
 
-    def list_saved_resources(self, course_code=None):
-        if not course_code:
-            return list(self.saved)
-        return [row for row in self.saved if row["course_code"] == course_code]
+    def list_saved_resources(self, course_code=None, user_id=None):
+        rows = list(self.saved)
+        if user_id:
+            rows = [row for row in rows if row.get("user_id") == user_id]
+        if course_code:
+            rows = [row for row in rows if row["course_code"] == course_code]
+        return rows
 
     def upsert_saved_resource(self, row):
-        existing = next((item for item in self.saved if item["course_code"] == row["course_code"] and item["resource_url"] == row["resource_url"]), None)
+        uid = row.get("user_id")
+        existing = next(
+            (
+                item
+                for item in self.saved
+                if item.get("user_id") == uid
+                and item["course_code"] == row["course_code"]
+                and item["resource_url"] == row["resource_url"]
+            ),
+            None,
+        )
         if existing:
             existing.update(row)
             return existing
@@ -43,10 +59,30 @@ class DummySupabase:
         self.saved.append(new_row)
         return new_row
 
-    def delete_saved_resource(self, resource_id):
-        original = len(self.saved)
-        self.saved = [item for item in self.saved if item["id"] != resource_id]
-        return len(self.saved) != original
+    def delete_saved_resource(self, resource_id, user_id=None):
+        before = len(self.saved)
+        if user_id:
+            self.saved = [
+                item
+                for item in self.saved
+                if not (item["id"] == resource_id and item.get("user_id") == user_id)
+            ]
+        else:
+            self.saved = [item for item in self.saved if item["id"] != resource_id]
+        return len(self.saved) != before
+
+    def insert_search_session(self, row):
+        self.sessions.append(row)
+        return row
+
+    def insert_result_impressions(self, rows):
+        self.impressions.extend(rows)
+        return len(rows)
+
+    def insert_feedback_event(self, row):
+        payload = {'id': f'feedback-{len(self.feedback)+1}', **row}
+        self.feedback.append(payload)
+        return payload
 
 
 class DummyAgent:
@@ -70,6 +106,8 @@ def test_search_requires_scrape_when_missing_syllabus(client, monkeypatch):
 
 
 def test_search_returns_ranked_top_10(client, monkeypatch):
+    sb = DummySupabase()
+    monkeypatch.setattr(app_module, "get_supabase_client", lambda: sb)
     raw_resources = []
     for idx in range(12):
         raw_resources.append(
@@ -85,6 +123,8 @@ def test_search_returns_ranked_top_10(client, monkeypatch):
     response = client.post("/api/search", json={"course_code": "ENGL 1101"})
     assert response.status_code == 200
     assert len(response.get_json()["results"]) == 10
+    first = response.get_json()["results"][0]
+    assert set(first["criteria_scores"].keys()) == set(app_module.Config.RUBRIC_CRITERIA)
 
 
 def test_ollama_unavailable_returns_503(client, monkeypatch):
@@ -94,6 +134,7 @@ def test_ollama_unavailable_returns_503(client, monkeypatch):
 
 
 def test_saved_resources_crud(client, monkeypatch):
+    monkeypatch.setattr(app_module.Config, "REQUIRE_AUTH_FOR_SAVES", False)
     sb = DummySupabase()
     monkeypatch.setattr(app_module, "get_supabase_client", lambda: sb)
 
@@ -116,6 +157,54 @@ def test_saved_resources_crud(client, monkeypatch):
 
     deleted = client.delete(f"/api/saved-resources/{created_id}")
     assert deleted.status_code == 200
+
+
+def test_saved_resources_requires_auth_when_enabled(client, monkeypatch):
+    monkeypatch.setattr(app_module.Config, "REQUIRE_AUTH_FOR_SAVES", True)
+    sb = DummySupabase()
+    monkeypatch.setattr(app_module, "get_supabase_client", lambda: sb)
+
+    response = client.post(
+        "/api/saved-resources",
+        json={
+            "course_code": "ENGL 1101",
+            "resource_url": "https://example.com/book",
+            "title": "Book",
+        },
+    )
+    assert response.status_code == 401
+
+
+def test_feedback_endpoints(client, monkeypatch):
+    sb = DummySupabase()
+    monkeypatch.setattr(app_module, "get_supabase_client", lambda: sb)
+
+    event_resp = client.post(
+        "/api/feedback/event",
+        json={
+            "event_type": "open_detail",
+            "course_code": "ENGL 1101",
+            "resource_url": "https://example.com/resource",
+            "result_id": "r-1",
+            "search_session_id": "s-1",
+        },
+    )
+    assert event_resp.status_code == 201
+
+    dispute_resp = client.post(
+        "/api/feedback/dispute",
+        json={
+            "course_code": "ENGL 1101",
+            "resource_url": "https://example.com/resource",
+            "criterion": "Technical Quality",
+            "old_score": 2,
+            "new_score": 4,
+            "reason": "Resource has exercises and stable hosting",
+            "result_id": "r-1",
+            "search_session_id": "s-1",
+        },
+    )
+    assert dispute_resp.status_code == 201
 
 
 def test_scrape_contracts(client, monkeypatch):

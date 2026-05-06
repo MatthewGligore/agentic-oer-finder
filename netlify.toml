@@ -1,0 +1,11 @@
+# Build the Vite app from /frontend. Set these in Netlify UI → Site settings → Environment variables:
+#   VITE_API_BASE_URL   — https://api.yourdomain.com (Flask via Cloudflare tunnel; no trailing slash)
+#   VITE_SUPABASE_URL   — optional; same as backend SUPABASE_URL
+#   VITE_SUPABASE_ANON_KEY — optional; same as backend SUPABASE_ANON_KEY
+[build]
+  base = "frontend"
+  command = "npm ci && npm run build"
+  publish = "dist"
+
+[build.environment]
+  NODE_VERSION = "20"

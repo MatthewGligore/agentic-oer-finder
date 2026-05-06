@@ -1,6 +1,33 @@
 import axios from 'axios'
+import { supabase } from '../lib/supabaseClient'
 
-const API_BASE = '/api'
+/** Empty in dev (Vite proxies /api). Set VITE_API_BASE_URL on Netlify to your Cloudflare tunnel API origin, no trailing slash. */
+const API_ORIGIN = (import.meta.env.VITE_API_BASE_URL || '').replace(/\/$/, '')
+const API_BASE = API_ORIGIN ? `${API_ORIGIN}/api` : '/api'
+
+function isApiRequestUrl(url) {
+  if (typeof url !== 'string') return false
+  if (url.startsWith('/api')) return true
+  if (API_ORIGIN && url.startsWith(`${API_ORIGIN}/api`)) return true
+  return false
+}
+
+async function authHeaders() {
+  if (!supabase) return {}
+  const {
+    data: { session },
+  } = await supabase.auth.getSession()
+  if (!session?.access_token) return {}
+  return { Authorization: `Bearer ${session.access_token}` }
+}
+
+axios.interceptors.request.use(async (config) => {
+  const url = config.url || ''
+  if (isApiRequestUrl(url)) {
+    Object.assign(config.headers, await authHeaders())
+  }
+  return config
+})
 
 const oerAPI = {
   search: async (courseCode, term = '') => {
@@ -12,17 +39,20 @@ const oerAPI = {
       return response.data
     } catch (error) {
       throw error.response?.data || {
-        error: 'Failed to search OER resources'
+        error: 'Failed to search OER resources',
       }
     }
   },
 
   searchStream: async (courseCode, term = '', handlers = {}) => {
+    const headers = {
+      'Content-Type': 'application/json',
+      ...(await authHeaders()),
+    }
+
     const response = await fetch(`${API_BASE}/search/stream`, {
       method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-      },
+      headers,
       body: JSON.stringify({
         course_code: courseCode,
         term,
@@ -88,7 +118,7 @@ const oerAPI = {
       return response.data
     } catch (error) {
       throw error.response?.data || {
-        error: 'Failed to fetch statistics'
+        error: 'Failed to fetch statistics',
       }
     }
   },
@@ -102,7 +132,7 @@ const oerAPI = {
       return response.data
     } catch (error) {
       throw error.response?.data || {
-        error: 'Failed to scrape syllabi'
+        error: 'Failed to scrape syllabi',
       }
     }
   },
@@ -133,6 +163,24 @@ const oerAPI = {
       return response.data
     } catch (error) {
       throw error.response?.data || { error: 'Failed to remove saved resource' }
+    }
+  },
+
+  postFeedbackEvent: async (payload) => {
+    try {
+      const response = await axios.post(`${API_BASE}/feedback/event`, payload)
+      return response.data
+    } catch (error) {
+      throw error.response?.data || { error: 'Failed to submit feedback event' }
+    }
+  },
+
+  disputeRating: async (payload) => {
+    try {
+      const response = await axios.post(`${API_BASE}/feedback/dispute`, payload)
+      return response.data
+    } catch (error) {
+      throw error.response?.data || { error: 'Failed to submit dispute' }
     }
   },
 }

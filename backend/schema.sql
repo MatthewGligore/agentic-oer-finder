@@ -37,9 +37,11 @@ CREATE TABLE IF NOT EXISTS syllabus_sections (
 CREATE INDEX IF NOT EXISTS idx_sections_syllabus_id ON syllabus_sections(syllabus_id);
 CREATE INDEX IF NOT EXISTS idx_sections_type ON syllabus_sections(section_type);
 
--- Saved resource snapshots for demo bookmarking.
+-- Saved resource snapshots for demo bookmarking (per-user when auth is enabled).
+-- Legacy anonymous/demo rows use LEGACY_SAVED_USER_ID (see migrations below).
 CREATE TABLE IF NOT EXISTS saved_resources (
   id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  user_id UUID NOT NULL DEFAULT '00000000-0000-4000-8000-000000000001'::uuid,
   course_code TEXT NOT NULL,
   resource_url TEXT NOT NULL,
   title TEXT NOT NULL,
@@ -51,10 +53,60 @@ CREATE TABLE IF NOT EXISTS saved_resources (
   evaluation_payload JSONB DEFAULT '{}'::jsonb,
   created_at TIMESTAMP WITH TIME ZONE DEFAULT now(),
   updated_at TIMESTAMP WITH TIME ZONE DEFAULT now(),
-  UNIQUE(course_code, resource_url)
+  CONSTRAINT saved_resources_user_course_url UNIQUE (user_id, course_code, resource_url)
 );
 
 CREATE INDEX IF NOT EXISTS idx_saved_resources_course_code ON saved_resources(course_code);
+
+-- Search/session telemetry for adaptive ranking.
+CREATE TABLE IF NOT EXISTS search_sessions (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  user_id UUID,
+  course_code TEXT NOT NULL,
+  term TEXT,
+  query_variants JSONB DEFAULT '[]'::jsonb,
+  syllabus_snapshot JSONB DEFAULT '{}'::jsonb,
+  created_at TIMESTAMP WITH TIME ZONE DEFAULT now()
+);
+
+CREATE INDEX IF NOT EXISTS idx_search_sessions_course_code ON search_sessions(course_code);
+
+CREATE TABLE IF NOT EXISTS result_impressions (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  search_session_id UUID NOT NULL REFERENCES search_sessions(id) ON DELETE CASCADE,
+  result_id TEXT NOT NULL,
+  resource_url TEXT NOT NULL,
+  rank_position INTEGER NOT NULL,
+  source TEXT,
+  final_rank_score NUMERIC,
+  feature_payload JSONB DEFAULT '{}'::jsonb,
+  evaluation_payload JSONB DEFAULT '{}'::jsonb,
+  created_at TIMESTAMP WITH TIME ZONE DEFAULT now(),
+  UNIQUE(search_session_id, result_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_result_impressions_session ON result_impressions(search_session_id);
+CREATE INDEX IF NOT EXISTS idx_result_impressions_resource ON result_impressions(resource_url);
+
+CREATE TABLE IF NOT EXISTS feedback_events (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  search_session_id UUID REFERENCES search_sessions(id) ON DELETE SET NULL,
+  user_id UUID,
+  result_id TEXT,
+  event_type TEXT NOT NULL CHECK (event_type IN ('click', 'save', 'open_detail', 'dispute', 'manual_override', 'thumbs_up', 'thumbs_down')),
+  course_code TEXT,
+  resource_url TEXT,
+  criterion TEXT,
+  old_score NUMERIC,
+  new_score NUMERIC,
+  reason TEXT,
+  metadata JSONB DEFAULT '{}'::jsonb,
+  created_at TIMESTAMP WITH TIME ZONE DEFAULT now()
+);
+
+CREATE INDEX IF NOT EXISTS idx_feedback_events_session ON feedback_events(search_session_id);
+CREATE INDEX IF NOT EXISTS idx_feedback_events_type ON feedback_events(event_type);
+CREATE INDEX IF NOT EXISTS idx_feedback_events_course ON feedback_events(course_code);
 
 -- Enable Full Text Search on section content (optional, for advanced search)
 ALTER TABLE syllabus_sections ADD COLUMN IF NOT EXISTS search_vector tsvector GENERATED ALWAYS AS (
@@ -104,3 +156,61 @@ CREATE OR REPLACE TRIGGER update_sections_updated_at
 BEFORE UPDATE ON syllabus_sections
 FOR EACH ROW
 EXECUTE FUNCTION update_updated_at_column();
+
+CREATE OR REPLACE TRIGGER update_saved_resources_updated_at
+BEFORE UPDATE ON saved_resources
+FOR EACH ROW
+EXECUTE FUNCTION update_updated_at_column();
+
+-- ---------------------------------------------------------------------------
+-- Global query-term statistics for adaptive OER search (mined from feedback).
+-- ---------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS query_term_stats (
+  subject TEXT NOT NULL,
+  term TEXT NOT NULL,
+  positive_count INTEGER NOT NULL DEFAULT 0,
+  negative_count INTEGER NOT NULL DEFAULT 0,
+  weight NUMERIC NOT NULL DEFAULT 0,
+  updated_at TIMESTAMP WITH TIME ZONE DEFAULT now(),
+  PRIMARY KEY (subject, term)
+);
+
+CREATE INDEX IF NOT EXISTS idx_query_term_stats_subject ON query_term_stats(subject);
+
+-- ---------------------------------------------------------------------------
+-- Idempotent migrations for databases created before multi-tenant columns.
+-- LEGACY_SAVED_USER_ID: rows without auth are attributed here until users re-save.
+-- ---------------------------------------------------------------------------
+ALTER TABLE saved_resources ADD COLUMN IF NOT EXISTS user_id UUID;
+UPDATE saved_resources SET user_id = '00000000-0000-4000-8000-000000000001'::uuid WHERE user_id IS NULL;
+ALTER TABLE saved_resources ALTER COLUMN user_id SET DEFAULT '00000000-0000-4000-8000-000000000001'::uuid;
+ALTER TABLE saved_resources ALTER COLUMN user_id SET NOT NULL;
+
+ALTER TABLE search_sessions ADD COLUMN IF NOT EXISTS user_id UUID;
+ALTER TABLE feedback_events ADD COLUMN IF NOT EXISTS user_id UUID;
+
+ALTER TABLE saved_resources DROP CONSTRAINT IF EXISTS saved_resources_course_code_resource_url_key;
+ALTER TABLE saved_resources DROP CONSTRAINT IF EXISTS saved_resources_user_course_url;
+ALTER TABLE saved_resources ADD CONSTRAINT saved_resources_user_course_url UNIQUE (user_id, course_code, resource_url);
+
+CREATE INDEX IF NOT EXISTS idx_saved_resources_user_course ON saved_resources(user_id, course_code);
+
+-- Row Level Security: direct PostgREST access with user JWT (backend uses service role and bypasses RLS).
+ALTER TABLE saved_resources ENABLE ROW LEVEL SECURITY;
+
+DROP POLICY IF EXISTS saved_resources_select_own ON saved_resources;
+DROP POLICY IF EXISTS saved_resources_insert_own ON saved_resources;
+DROP POLICY IF EXISTS saved_resources_update_own ON saved_resources;
+DROP POLICY IF EXISTS saved_resources_delete_own ON saved_resources;
+
+CREATE POLICY saved_resources_select_own ON saved_resources
+  FOR SELECT USING (auth.uid() = user_id);
+
+CREATE POLICY saved_resources_insert_own ON saved_resources
+  FOR INSERT WITH CHECK (auth.uid() = user_id);
+
+CREATE POLICY saved_resources_update_own ON saved_resources
+  FOR UPDATE USING (auth.uid() = user_id);
+
+CREATE POLICY saved_resources_delete_own ON saved_resources
+  FOR DELETE USING (auth.uid() = user_id);

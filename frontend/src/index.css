@@ -1806,6 +1806,42 @@ body {
   flex-wrap: wrap;
 }
 
+.modal-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 200;
+  background: rgba(10, 16, 24, 0.62);
+  display: grid;
+  place-items: center;
+  padding: 1rem;
+}
+
+.details-modal {
+  width: min(920px, 100%);
+  max-height: calc(100vh - 2rem);
+  overflow-y: auto;
+  padding: 1.25rem;
+}
+
+.modal-close {
+  width: 2.25rem;
+  height: 2.25rem;
+  border-radius: 999px;
+  border: 1px solid var(--line-soft);
+  background: var(--surface-strong);
+  color: var(--text-strong);
+  font-weight: 700;
+  cursor: pointer;
+}
+
+.modal-close:hover {
+  border-color: var(--accent);
+}
+
+.details-modal-actions {
+  margin-top: 1rem;
+}
+
 .action-row a,
 .resource-card a,
 .featured-resource-copy a {
@@ -2375,4 +2411,93 @@ html.dark .result-badge,
 html.dark .kicker,
 html.dark .status-kicker {
   color: var(--accent-strong);
+}
+
+/* Auth pages */
+.auth-page-shell {
+  min-height: calc(100vh - 90px);
+  display: grid;
+  place-items: center;
+}
+
+.auth-card {
+  width: min(520px, 100%);
+  border: 1px solid var(--line-strong);
+  border-radius: 24px;
+  background: var(--surface);
+  box-shadow: 0 20px 38px -30px rgba(18, 39, 47, 0.48);
+  padding: 1.4rem;
+}
+
+.auth-card h1 {
+  margin: 0.2rem 0 0.4rem;
+  font-family: 'Sora', 'IBM Plex Sans', sans-serif;
+  letter-spacing: -0.03em;
+}
+
+.auth-form {
+  margin-top: 0.9rem;
+  border: 1px solid var(--line-soft);
+  border-radius: 18px;
+  background: var(--surface-strong);
+  padding: 1rem;
+}
+
+.field-label {
+  font-size: 0.82rem;
+  font-weight: 700;
+  letter-spacing: 0.05em;
+  text-transform: uppercase;
+  color: var(--muted-strong);
+}
+
+.text-input {
+  width: 100%;
+  height: 48px;
+  border-radius: 12px;
+  border: 1px solid var(--line-soft);
+  background: rgba(255, 255, 255, 0.96);
+  color: var(--text-strong);
+  padding: 0 0.85rem;
+  font: inherit;
+}
+
+.text-input:focus {
+  outline: none;
+  border-color: rgba(11, 111, 126, 0.36);
+  box-shadow: 0 0 0 3px rgba(11, 111, 126, 0.14);
+}
+
+.auth-actions {
+  justify-content: flex-start;
+}
+
+.auth-link-btn {
+  display: inline-flex;
+  align-items: center;
+}
+
+.auth-cta-row {
+  margin-top: 0.9rem;
+  display: flex;
+  gap: 0.6rem;
+  flex-wrap: wrap;
+}
+
+html.dark .auth-card,
+html.dark .auth-form {
+  background: var(--surface);
+  border-color: var(--line-subtle);
+  box-shadow: none;
+}
+
+html.dark .text-input {
+  background: #12121b;
+  color: #ececf4;
+  border-color: var(--line-subtle);
+}
+
+html.dark .text-input:focus {
+  border-color: var(--accent);
+  box-shadow: 0 0 0 3px #2c2350;
 }

@@ -325,14 +325,20 @@ class SupabaseClient:
 
     # ===== SAVED RESOURCES TABLE OPERATIONS =====
 
-    def list_saved_resources(self, course_code: Optional[str] = None) -> List[Dict[str, Any]]:
-        """List saved resources, optionally filtered by course code."""
+    def list_saved_resources(
+        self,
+        course_code: Optional[str] = None,
+        user_id: Optional[str] = None,
+    ) -> List[Dict[str, Any]]:
+        """List saved resources for a user, optionally filtered by course code."""
         if not self.is_available():
             return []
         if not self._saved_resources_available:
             return []
         try:
             query = self.client.table('saved_resources').select('*').order('created_at', desc=True)
+            if user_id:
+                query = query.eq('user_id', user_id)
             if course_code:
                 query = query.eq('course_code', course_code)
             response = query.execute()
@@ -354,7 +360,7 @@ class SupabaseClient:
         try:
             response = self.client.table('saved_resources').upsert(
                 row,
-                on_conflict='course_code,resource_url',
+                on_conflict='user_id,course_code,resource_url',
             ).execute()
             return response.data[0] if response.data else None
         except Exception as e:
@@ -365,14 +371,17 @@ class SupabaseClient:
             logger.error(f"Error upserting saved resource: {e}")
             return None
 
-    def delete_saved_resource(self, resource_id: str) -> bool:
-        """Delete saved resource by id."""
+    def delete_saved_resource(self, resource_id: str, user_id: Optional[str] = None) -> bool:
+        """Delete saved resource by id (scoped to user when user_id is provided)."""
         if not self.is_available():
             return False
         if not self._saved_resources_available:
             return False
         try:
-            response = self.client.table('saved_resources').delete().eq('id', resource_id).execute()
+            query = self.client.table('saved_resources').delete().eq('id', resource_id)
+            if user_id:
+                query = query.eq('user_id', user_id)
+            response = query.execute()
             return bool(response.data)
         except Exception as e:
             if self._is_missing_saved_resources_table(e):
@@ -386,6 +395,174 @@ class SupabaseClient:
         """Detect Supabase schema-cache errors for optional saved_resources support."""
         text = str(exc)
         return 'PGRST205' in text or "saved_resources" in text and 'schema cache' in text.lower()
+
+    # ===== FEEDBACK/LEARNING TABLE OPERATIONS =====
+
+    def insert_search_session(self, row: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        """Insert a search session row used for learning telemetry."""
+        if not self.is_available():
+            return None
+        try:
+            response = self.client.table('search_sessions').upsert(
+                row,
+                on_conflict='id',
+            ).execute()
+            return response.data[0] if response.data else None
+        except Exception as e:
+            logger.error(f"Error inserting search session: {e}")
+            return None
+
+    def insert_result_impressions(self, rows: List[Dict[str, Any]]) -> int:
+        """Insert result impression rows for one search session."""
+        if not self.is_available() or not rows:
+            return 0
+        try:
+            response = self.client.table('result_impressions').upsert(
+                rows,
+                on_conflict='search_session_id,result_id',
+            ).execute()
+            return len(response.data) if response.data else 0
+        except Exception as e:
+            logger.error(f"Error inserting result impressions: {e}")
+            return 0
+
+    def insert_feedback_event(self, row: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        """Insert a user feedback event row."""
+        if not self.is_available():
+            return None
+        try:
+            response = self.client.table('feedback_events').insert(row).execute()
+            return response.data[0] if response.data else None
+        except Exception as e:
+            text = str(e)
+            # Streaming UI can submit feedback before session telemetry row is persisted.
+            # If FK fails, retry once with nullable search_session_id so feedback is still captured.
+            if 'feedback_events_search_session_id_fkey' in text and row.get('search_session_id'):
+                retry_row = dict(row)
+                retry_row['search_session_id'] = None
+                try:
+                    response = self.client.table('feedback_events').insert(retry_row).execute()
+                    logger.warning("Inserted feedback without search_session_id after FK conflict")
+                    return response.data[0] if response.data else None
+                except Exception as retry_exc:
+                    logger.error(f"Error inserting feedback event after FK retry: {retry_exc}")
+                    return None
+            logger.error(f"Error inserting feedback event: {e}")
+            return None
+
+    def fetch_training_rows(self, limit: int = 1000) -> List[Dict[str, Any]]:
+        """Fetch joined feedback/impression rows for reranker training."""
+        if not self.is_available():
+            return []
+        try:
+            feedback_resp = self.client.table('feedback_events').select('*').order('created_at', desc=True).limit(limit).execute()
+            feedback_rows = feedback_resp.data or []
+            if not feedback_rows:
+                return []
+
+            # Join in Python to keep SQL dependency lightweight for now.
+            key_pairs = [
+                (row.get('search_session_id'), row.get('result_id'))
+                for row in feedback_rows
+                if row.get('search_session_id') and row.get('result_id')
+            ]
+            if not key_pairs:
+                return []
+
+            impressions_resp = self.client.table('result_impressions').select('*').order('created_at', desc=True).limit(limit * 5).execute()
+            impressions = impressions_resp.data or []
+            by_key = {
+                (row.get('search_session_id'), row.get('result_id')): row
+                for row in impressions
+            }
+
+            joined = []
+            for feedback in feedback_rows:
+                key = (feedback.get('search_session_id'), feedback.get('result_id'))
+                impression = by_key.get(key)
+                if impression:
+                    joined.append({
+                        'feedback': feedback,
+                        'impression': impression,
+                    })
+            return joined
+        except Exception as e:
+            logger.error(f"Error fetching training rows: {e}")
+            return []
+
+    def fetch_query_policy_stats(self, course_code: Optional[str] = None, limit: int = 2000) -> List[Dict[str, Any]]:
+        """Fetch impressions and feedback for adaptive query policy updates."""
+        if not self.is_available():
+            return []
+        try:
+            impression_query = self.client.table('result_impressions').select('*').order('created_at', desc=True).limit(limit)
+            if course_code:
+                # Filter via related feedback when available; keep broad impressions otherwise.
+                pass
+            impressions_resp = impression_query.execute()
+            impressions = impressions_resp.data or []
+            if not impressions:
+                return []
+
+            feedback_resp = self.client.table('feedback_events').select('*').order('created_at', desc=True).limit(limit).execute()
+            feedback_rows = feedback_resp.data or []
+            feedback_by_key: Dict[tuple, List[Dict[str, Any]]] = {}
+            for row in feedback_rows:
+                key = (row.get('search_session_id'), row.get('result_id'))
+                feedback_by_key.setdefault(key, []).append(row)
+
+            rows = []
+            for impression in impressions:
+                key = (impression.get('search_session_id'), impression.get('result_id'))
+                rows.append({'impression': impression, 'feedback': feedback_by_key.get(key, [])})
+            return rows
+        except Exception as e:
+            logger.error(f"Error fetching query policy stats: {e}")
+            return []
+
+    def upsert_term_stats(self, rows: List[Dict[str, Any]]) -> int:
+        """Upsert mined query_term_stats rows (subject, term, counts, weight)."""
+        if not self.is_available() or not rows:
+            return 0
+        try:
+            response = self.client.table('query_term_stats').upsert(
+                rows,
+                on_conflict='subject,term',
+            ).execute()
+            return len(response.data) if response.data else 0
+        except Exception as e:
+            logger.error(f"Error upserting query_term_stats: {e}")
+            return 0
+
+    def fetch_term_policy(self, subject: str) -> List[Dict[str, Any]]:
+        """Fetch term statistics for a course subject prefix (e.g. ENGL)."""
+        if not self.is_available():
+            return []
+        try:
+            subject_key = (subject or '').strip().upper()
+            if not subject_key:
+                return []
+            response = (
+                self.client.table('query_term_stats')
+                .select('*')
+                .eq('subject', subject_key)
+                .order('weight', desc=True)
+                .execute()
+            )
+            return response.data or []
+        except Exception as e:
+            logger.error(f"Error fetching query_term_stats for {subject}: {e}")
+            return []
+
+    def delete_term_stats_for_subjects(self, subjects: List[str]) -> None:
+        """Remove stats rows before full recompute (optional subjects filter)."""
+        if not self.is_available() or not subjects:
+            return
+        try:
+            for sub in subjects:
+                self.client.table('query_term_stats').delete().eq('subject', sub).execute()
+        except Exception as e:
+            logger.warning(f"Could not clear query_term_stats: {e}")
 
 
 # Singleton instance

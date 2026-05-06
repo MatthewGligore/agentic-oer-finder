@@ -10,6 +10,7 @@
     "lint": "eslint src --ext .jsx,.js"
   },
   "dependencies": {
+    "@supabase/supabase-js": "^2.105.3",
     "@tailwindcss/vite": "^4.2.1",
     "axios": "^1.6.0",
     "react": "^18.2.0",

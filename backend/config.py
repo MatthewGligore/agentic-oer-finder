@@ -47,7 +47,21 @@ class Config:
     SUPABASE_URL = os.getenv('SUPABASE_URL', '')
     SUPABASE_ANON_KEY = os.getenv('SUPABASE_ANON_KEY', '')
     SUPABASE_SERVICE_ROLE_KEY = os.getenv('SUPABASE_SERVICE_ROLE_KEY', '')
+    SUPABASE_JWT_SECRET = os.getenv('SUPABASE_JWT_SECRET', '')
+    SUPABASE_JWT_KID = os.getenv('SUPABASE_JWT_KID', '')
+    SUPABASE_JWKS_URL = os.getenv('SUPABASE_JWKS_URL', '').strip() or (
+        f"{SUPABASE_URL.rstrip('/')}/auth/v1/.well-known/jwks.json" if SUPABASE_URL else ''
+    )
     USE_SUPABASE = bool(SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY)
+    REQUIRE_AUTH_FOR_SAVES = os.getenv('REQUIRE_AUTH_FOR_SAVES', 'true').lower() == 'true'
+    # Anonymous/demo bookmarks before auth (must match schema.sql legacy default)
+    LEGACY_SAVED_USER_ID = os.getenv('LEGACY_SAVED_USER_ID', '00000000-0000-4000-8000-000000000001')
+
+    # Term policy (mined from global feedback)
+    ENABLE_TERM_POLICY = os.getenv('ENABLE_TERM_POLICY', 'true').lower() == 'true'
+    TERM_POLICY_BLEND_WEIGHT = float(os.getenv('TERM_POLICY_BLEND_WEIGHT', '0.5'))
+    TERM_POLICY_TOP_K = int(os.getenv('TERM_POLICY_TOP_K', '8'))
+    TERM_POLICY_SUPPRESS_THRESHOLD = float(os.getenv('TERM_POLICY_SUPPRESS_THRESHOLD', '-2.0'))
     
     # Required Courses for Testing
     REQUIRED_COURSES = [
@@ -81,6 +95,13 @@ class Config:
     # relevance score is normalized to 1-5 before weighting.
     RELEVANCE_WEIGHT = float(os.getenv('RELEVANCE_WEIGHT', '0.6'))
     RUBRIC_WEIGHT = float(os.getenv('RUBRIC_WEIGHT', '0.4'))
+    RERANKER_WEIGHT = float(os.getenv('RERANKER_WEIGHT', '0.35'))
+    ENABLE_RERANKER = os.getenv('ENABLE_RERANKER', 'true').lower() == 'true'
+    ENABLE_ADAPTIVE_QUERY_POLICY = os.getenv('ENABLE_ADAPTIVE_QUERY_POLICY', 'true').lower() == 'true'
+    ENABLE_RATING_DISPUTES = os.getenv('ENABLE_RATING_DISPUTES', 'true').lower() == 'true'
+    RERANKER_MIN_TRAINING_SAMPLES = int(os.getenv('RERANKER_MIN_TRAINING_SAMPLES', '30'))
+    ADAPTIVE_QUERY_EPSILON = float(os.getenv('ADAPTIVE_QUERY_EPSILON', '0.15'))
+    ADAPTIVE_QUERY_HISTORY_LIMIT = int(os.getenv('ADAPTIVE_QUERY_HISTORY_LIMIT', '200'))
 
     # Candidate and evaluation budgets
     MAX_PRIMARY_CANDIDATES = int(os.getenv('MAX_PRIMARY_CANDIDATES', '24'))

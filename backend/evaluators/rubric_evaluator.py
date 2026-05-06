@@ -57,7 +57,41 @@ class RubricEvaluator:
         # Generate summary
         evaluation['summary'] = self._generate_summary(evaluation)
         
-        return evaluation
+        return self._ensure_full_criteria_coverage(evaluation)
+
+    def empty_evaluation(self, summary: str = 'Evaluation incomplete') -> Dict:
+        """Build a canonical low-confidence evaluation with all criteria present."""
+        evaluation = {
+            'criteria_evaluations': {},
+            'overall_score': 0.0,
+            'summary': summary,
+        }
+        return self._ensure_full_criteria_coverage(evaluation)
+
+    def _ensure_full_criteria_coverage(self, evaluation: Dict) -> Dict:
+        """Guarantee every configured criterion has a stable score/explanation payload."""
+        criteria_evaluations = (evaluation or {}).get('criteria_evaluations', {}) or {}
+        normalized = {}
+        for criterion in self.criteria:
+            existing = criteria_evaluations.get(criterion, {}) if isinstance(criteria_evaluations, dict) else {}
+            score = existing.get('score', 0)
+            try:
+                score = float(score)
+            except (TypeError, ValueError):
+                score = 0.0
+            normalized[criterion] = {
+                'criterion': criterion,
+                'score': max(0.0, min(5.0, score)),
+                'explanation': existing.get('explanation') or 'Insufficient evidence; defaulted pending manual review.',
+                'evidence': existing.get('evidence') if isinstance(existing.get('evidence'), list) else [],
+            }
+
+        overall = sum(item.get('score', 0) for item in normalized.values()) / len(normalized) if normalized else 0.0
+        return {
+            'criteria_evaluations': normalized,
+            'overall_score': overall,
+            'summary': evaluation.get('summary') or self._generate_summary({'criteria_evaluations': normalized, 'overall_score': overall}),
+        }
     
     def _evaluate_criterion(self, resource: Dict, criterion: str, llm_evaluation: Dict = None) -> Dict:
         """Evaluate a specific criterion"""

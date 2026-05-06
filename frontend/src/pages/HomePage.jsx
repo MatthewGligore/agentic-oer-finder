@@ -1,9 +1,11 @@
-import React from 'react'
-import { useNavigate } from 'react-router-dom'
+import React, { useEffect, useMemo, useState } from 'react'
+import { Link, useNavigate } from 'react-router-dom'
 import { useAppState } from '../context/AppState'
+import { useAuth } from '../context/AuthContext'
 
 function HomePage() {
   const navigate = useNavigate()
+  const { user, supabaseConfigured } = useAuth()
   const {
     analysisDetail,
     analysisProgress,
@@ -18,8 +20,15 @@ function HomePage() {
     setCourseCode,
     setTerm,
     term,
+    logFeedbackEvent,
+    submitDispute,
     toggleSavedResource,
   } = useAppState()
+  const [activeResource, setActiveResource] = useState(null)
+  const [selectedCriterion, setSelectedCriterion] = useState('')
+  const [overrideScore, setOverrideScore] = useState('3')
+  const [disputeReason, setDisputeReason] = useState('')
+  const [disputeStatus, setDisputeStatus] = useState('')
 
   const resourceCount = normalizedResources.length
   const hasResults = normalizedResources.length > 0
@@ -36,11 +45,8 @@ function HomePage() {
 
   const quickCourses = ['ENGL 1101', 'ITEC 1001', 'HIST 2111', 'BIOL 1101K']
 
-  const topCriteria = (criteriaScores = {}) => (
-    Object.entries(criteriaScores)
-      .map(([name, value]) => ({ name, score: Number(value || 0) }))
-      .sort((a, b) => b.score - a.score)
-      .slice(0, 4)
+  const orderedCriteria = (criteriaScores = {}) => (
+    Object.entries(criteriaScores).map(([name, value]) => ({ name, score: Number(value || 0) }))
   )
 
   const scoreBand = (score) => {
@@ -48,6 +54,79 @@ function HomePage() {
     if (score >= 3.4) return 'strong'
     if (score >= 2.4) return 'fair'
     return 'weak'
+  }
+
+  const activeCriteria = useMemo(() => {
+    if (!activeResource) {
+      return []
+    }
+    return Object.entries(activeResource.criteriaScores || {}).map(([name, score]) => ({
+      name,
+      score: Number(score || 0),
+      explanation: activeResource.criteriaExplanations?.[name] || 'No explanation available.',
+    }))
+  }, [activeResource])
+
+  useEffect(() => {
+    if (!activeResource) {
+      return undefined
+    }
+
+    const previousOverflow = document.body.style.overflow
+    document.body.style.overflow = 'hidden'
+
+    const handleEscape = (event) => {
+      if (event.key === 'Escape') {
+        setActiveResource(null)
+      }
+    }
+
+    window.addEventListener('keydown', handleEscape)
+
+    return () => {
+      window.removeEventListener('keydown', handleEscape)
+      document.body.style.overflow = previousOverflow
+    }
+  }, [activeResource])
+
+  const openDetails = async (resource) => {
+    const firstCriterion = Object.keys(resource.criteriaScores || {})[0] || ''
+    setActiveResource(resource)
+    setSelectedCriterion(firstCriterion)
+    setOverrideScore(String(Math.round(Number(resource.criteriaScores?.[firstCriterion] || 3))))
+    setDisputeReason('')
+    setDisputeStatus('')
+    await logFeedbackEvent({
+      search_session_id: resource.searchSessionId,
+      result_id: resource.resultId,
+      event_type: 'open_detail',
+      course_code: courseCode,
+      resource_url: resource.url,
+      metadata: { from: 'home_modal' },
+    })
+  }
+
+  const submitCriterionDispute = async () => {
+    if (!activeResource || !selectedCriterion) {
+      return
+    }
+    try {
+      const oldScore = Number(activeResource.criteriaScores?.[selectedCriterion] || 0)
+      await submitDispute({
+        search_session_id: activeResource.searchSessionId,
+        result_id: activeResource.resultId,
+        course_code: courseCode,
+        resource_url: activeResource.url,
+        criterion: selectedCriterion,
+        old_score: oldScore,
+        new_score: Number(overrideScore || 0),
+        reason: disputeReason || 'Manual dispute from details modal',
+        manual_override: true,
+      })
+      setDisputeStatus('Dispute submitted successfully.')
+    } catch (err) {
+      setDisputeStatus(err?.error || 'Could not submit dispute.')
+    }
   }
 
   return (
@@ -87,6 +166,12 @@ function HomePage() {
               </button>
             ))}
           </div>
+          {supabaseConfigured && !user ? (
+            <div className="auth-cta-row">
+              <Link className="primary-action" to="/register">Create account</Link>
+              <Link className="secondary-action" to="/login">Sign in</Link>
+            </div>
+          ) : null}
         </div>
 
         <aside className="pipeline-card" aria-live="polite">
@@ -216,7 +301,7 @@ function HomePage() {
                 <div className="card-section card-rubric-section">
                   <p className="rubric-title">Rubric highlights</p>
                   <div className="rubric-strip">
-                    {topCriteria(resource.criteriaScores).map(({ name, score }) => (
+                    {orderedCriteria(resource.criteriaScores).map(({ name, score }) => (
                       <div key={name} className="rubric-row">
                         <div className="rubric-row-head">
                           <span>{name.replaceAll('_', ' ')}</span>
@@ -232,13 +317,34 @@ function HomePage() {
 
                 <div className="card-section card-footer-section">
                   <div className="action-row">
-                    <a href={resource.url} target="_blank" rel="noopener noreferrer">
+                    <a
+                      href={resource.url}
+                      target="_blank"
+                      rel="noopener noreferrer"
+                      onClick={() => logFeedbackEvent({
+                        search_session_id: resource.searchSessionId,
+                        result_id: resource.resultId,
+                        event_type: 'click',
+                        course_code: courseCode,
+                        resource_url: resource.url,
+                        metadata: { from: 'open_resource' },
+                      })}
+                    >
                       Open resource
                     </a>
                     <button
                       type="button"
                       className="secondary-action"
-                      onClick={() => toggleSavedResource(resource)}
+                      onClick={() => openDetails(resource)}
+                    >
+                      View details
+                    </button>
+                    <button
+                      type="button"
+                      className="secondary-action"
+                      onClick={async () => {
+                        await toggleSavedResource(resource)
+                      }}
                     >
                       {resource.saved ? 'Unsave' : 'Save to library'}
                     </button>
@@ -254,6 +360,70 @@ function HomePage() {
           </div>
         )}
       </section>
+
+      {activeResource && (
+        <div
+          className="modal-backdrop"
+          role="dialog"
+          aria-modal="true"
+          aria-labelledby="resource-details-title"
+          onClick={() => setActiveResource(null)}
+        >
+          <section className="panel details-modal" onClick={(event) => event.stopPropagation()}>
+            <div className="section-heading">
+              <div>
+                <p className="eyebrow">Resource details</p>
+                <h2 id="resource-details-title">{activeResource.title}</h2>
+                <p className="muted-copy">{activeResource.description}</p>
+              </div>
+              <button
+                type="button"
+                className="modal-close"
+                onClick={() => setActiveResource(null)}
+                aria-label="Close details modal"
+              >
+                X
+              </button>
+            </div>
+            <div className="rubric-strip">
+              {activeCriteria.map((criterion) => (
+                <div key={criterion.name} className="rubric-row">
+                  <div className="rubric-row-head">
+                    <span>{criterion.name}</span>
+                    <strong>{criterion.score.toFixed(1)} / 5</strong>
+                  </div>
+                  <p>{criterion.explanation}</p>
+                </div>
+              ))}
+            </div>
+            <div className="action-row details-modal-actions">
+              <select value={selectedCriterion} onChange={(e) => setSelectedCriterion(e.target.value)}>
+                {activeCriteria.map((criterion) => (
+                  <option key={criterion.name} value={criterion.name}>
+                    {criterion.name}
+                  </option>
+                ))}
+              </select>
+              <input
+                type="number"
+                min="0"
+                max="5"
+                step="1"
+                value={overrideScore}
+                onChange={(e) => setOverrideScore(e.target.value)}
+              />
+              <input
+                type="text"
+                value={disputeReason}
+                placeholder="Why should this score change?"
+                onChange={(e) => setDisputeReason(e.target.value)}
+              />
+              <button type="button" onClick={submitCriterionDispute}>Submit dispute</button>
+            </div>
+            {disputeStatus && <p className="muted-copy">{disputeStatus}</p>}
+          </section>
+        </div>
+      )}
 
       <section className="panel dashboard-info-grid">
         <article className="feature-card">

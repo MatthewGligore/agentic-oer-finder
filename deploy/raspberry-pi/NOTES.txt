@@ -1,0 +1,7 @@
+Install steps (summary):
+1. Clone repo to /home/pi/agentic-oer-finder; python3 -m venv .venv; .venv/bin/pip install -r backend/requirements.txt
+2. Place repo-root .env (DEBUG=False, CORS_ALLOWED_ORIGINS=https://your-site.netlify.app,...)
+3. sudo cp oer-api.service /etc/systemd/system/ && sudo systemctl enable --now oer-api
+4. cloudflared tunnel login; tunnel create; route DNS; sudo cp credentials to /etc/cloudflared/
+5. sudo cp cloudflared-config.example.yml /etc/cloudflared/config.yml (edit UUID + hostname)
+6. If cloudflared is not at /usr/bin/cloudflared, run: which cloudflared and edit ExecStart in cloudflared.service before copying to /etc/systemd/system/

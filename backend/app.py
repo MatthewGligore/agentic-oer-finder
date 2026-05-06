@@ -2,7 +2,7 @@
 Flask API Backend for Agentic OER Finder
 Provides REST API endpoints for the React frontend
 """
-from flask import Flask, Response, jsonify, request, stream_with_context
+from flask import Flask, Response, g, jsonify, request, stream_with_context
 from flask_cors import CORS
 import json
 import logging
@@ -12,11 +12,15 @@ import sys
 import re
 import threading
 from datetime import datetime, timezone
+from uuid import uuid4
 from .oer_agent import OERAgent
 from .config import Config
 from .scrapers.library_index_scraper import fetch_library_index, fetch_library_index_for_course
 from .scrapers.syllabus_content_scraper import fetch_and_parse_syllabus, prepare_section_records
 from .llm.supabase_client import get_supabase_client
+from .learning.train_reranker import train_and_save
+from .learning.term_miner import mine_term_stats_from_training_rows
+from .auth import attach_current_user, current_user_id, login_required
 
 app = Flask(__name__)
 app.config.from_object(Config)
@@ -26,6 +30,22 @@ CORS(app, resources={r"/api/*": {"origins": Config.CORS_ALLOWED_ORIGINS}})
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
+
+@app.before_request
+def _attach_user():
+    if request.path.startswith('/api/'):
+        attach_current_user()
+
+
+def _effective_user_id() -> str | None:
+    """Authenticated user id, or legacy UUID when auth-for-saves is disabled (demo/tests)."""
+    uid = current_user_id()
+    if uid:
+        return uid
+    if not getattr(Config, 'REQUIRE_AUTH_FOR_SAVES', True):
+        return Config.LEGACY_SAVED_USER_ID
+    return None
 
 # Initialize agent
 agent = None
@@ -50,11 +70,16 @@ def get_agent():
     return agent
 
 
-def _get_saved_by_url(course_code: str) -> dict:
+def _get_saved_by_url(course_code: str, user_id: str | None = None) -> dict:
     sb = get_supabase_client()
     if not sb.is_available():
         return {}
-    saved_rows = sb.list_saved_resources(course_code)
+    uid = user_id
+    if uid is None:
+        uid = _effective_user_id()
+    if not uid:
+        return {}
+    saved_rows = sb.list_saved_resources(course_code, user_id=uid)
     return {row.get('resource_url'): row for row in saved_rows}
 
 
@@ -63,7 +88,16 @@ def _normalize_evaluated_resource(item: dict, rank: int, saved_by_url: dict) -> 
     rubric = item.get('rubric_evaluation', {}) or {}
     criteria = rubric.get('criteria_evaluations', {}) or {}
     saved_row = saved_by_url.get(resource.get('url', ''))
+    criteria_scores = {}
+    criteria_explanations = {}
+    for criterion in Config.RUBRIC_CRITERIA:
+        criterion_eval = criteria.get(criterion, {}) if isinstance(criteria, dict) else {}
+        criteria_scores[criterion] = criterion_eval.get('score', 0)
+        criteria_explanations[criterion] = criterion_eval.get('explanation') or 'No explanation available.'
+
     return {
+        'result_id': item.get('result_id') or f"result-{rank}-{uuid4().hex[:8]}",
+        'search_session_id': item.get('search_session_id'),
         'rank': rank,
         'title': resource.get('title', 'Untitled Resource'),
         'description': resource.get('description', ''),
@@ -74,30 +108,63 @@ def _normalize_evaluated_resource(item: dict, rank: int, saved_by_url: dict) -> 
         'reasoning_summary': item.get('syllabus_relevance', {}).get('rationale')
         or rubric.get('summary')
         or 'Matched by syllabus-aware ranking.',
-        'criteria_scores': {key: value.get('score') for key, value in criteria.items()},
-        'criteria_explanations': {key: value.get('explanation') for key, value in criteria.items()},
+        'criteria_scores': criteria_scores,
+        'criteria_explanations': criteria_explanations,
         'saved': bool(saved_row),
         'saved_id': saved_row.get('id') if saved_row else None,
         'evaluation_payload': item,
     }
 
 
-def _normalize_search_results(results: dict, course_code: str, term: str) -> dict:
+def _normalize_search_results(results: dict, course_code: str, term: str, user_id: str | None = None) -> dict:
     if not isinstance(results.get('evaluated_resources'), list):
         results['evaluated_resources'] = []
 
-    saved_by_url = _get_saved_by_url(course_code)
+    saved_by_url = _get_saved_by_url(course_code, user_id=user_id)
     normalized_resources = []
     for idx, item in enumerate(results.get('evaluated_resources', [])[:DEMO_MAX_OER_PER_SEARCH], start=1):
         normalized_resources.append(_normalize_evaluated_resource(item, idx, saved_by_url))
 
     return {
+        'search_session_id': results.get('search_session_id'),
         'course_code': results.get('course_code', course_code),
         'term': results.get('term', term),
         'resources_found': results.get('resources_found', len(normalized_resources)),
+        'query_variants': results.get('query_variants', []),
+        'syllabus_info': results.get('syllabus_info', {}),
         'results': normalized_resources,
         'summary': results.get('summary', ''),
     }
+
+
+def _log_search_impressions(sb, payload: dict, user_id: str | None = None) -> None:
+    """Persist search session and ranked impressions for learning signals."""
+    if not sb.is_available():
+        return
+    search_session_id = payload.get('search_session_id') or str(uuid4())
+    session_row = {
+        'id': search_session_id,
+        'user_id': user_id,
+        'course_code': payload.get('course_code', ''),
+        'term': payload.get('term', ''),
+        'query_variants': payload.get('query_variants', []),
+        'syllabus_snapshot': payload.get('syllabus_info', {}),
+    }
+    sb.insert_search_session(session_row)
+
+    impressions = []
+    for resource in payload.get('results', []):
+        impressions.append({
+            'search_session_id': search_session_id,
+            'result_id': resource.get('result_id'),
+            'resource_url': resource.get('resource_url'),
+            'rank_position': resource.get('rank', 0),
+            'source': resource.get('source'),
+            'final_rank_score': resource.get('final_rank_score', 0),
+            'feature_payload': resource.get('feature_payload', {}),
+            'evaluation_payload': resource.get('evaluation_payload', {}),
+        })
+    sb.insert_result_impressions(impressions)
 
 @app.route('/api/health', methods=['GET'])
 def health():
@@ -139,7 +206,9 @@ def search_oer():
                 'scrape_ui_path': '/scrape',
             }), 409
         
-        response_payload = _normalize_search_results(results, course_code, term)
+        uid_save = _effective_user_id()
+        response_payload = _normalize_search_results(results, course_code, term, user_id=uid_save)
+        _log_search_impressions(get_supabase_client(), response_payload, user_id=current_user_id())
 
         logger.info(f"Sending response with {len(response_payload.get('results', []))} ranked results")
         return jsonify(response_payload), 200
@@ -168,19 +237,40 @@ def search_oer_stream():
     def generate():
         output_queue: Queue = Queue()
         done_event = threading.Event()
+        stream_session_id: str | None = None
+        stream_session_logged = False
+        request_user_id = current_user_id()
 
         try:
             oer_agent = get_agent()
-            saved_by_url = _get_saved_by_url(course_code)
+            uid_save_stream = _effective_user_id()
+            saved_by_url = _get_saved_by_url(course_code, user_id=uid_save_stream)
             stream_rank = 0
 
             def on_resource_evaluated(event: dict):
-                nonlocal stream_rank
+                nonlocal stream_rank, stream_session_id, stream_session_logged
                 if stream_rank >= DEMO_MAX_OER_PER_SEARCH:
                     return
                 evaluated_item = event.get('evaluated_resource')
                 if not evaluated_item:
                     return
+                if not stream_session_logged:
+                    stream_session_id = (
+                        evaluated_item.get('search_session_id')
+                        or event.get('search_session_id')
+                        or str(uuid4())
+                    )
+                    # Persist a minimal session row immediately so feedback/disputes posted
+                    # during streaming satisfy FK constraints.
+                    get_supabase_client().insert_search_session({
+                        'id': stream_session_id,
+                        'user_id': request_user_id,
+                        'course_code': course_code,
+                        'term': term,
+                        'query_variants': [],
+                        'syllabus_snapshot': {},
+                    })
+                    stream_session_logged = True
                 stream_rank += 1
                 normalized = _normalize_evaluated_resource(evaluated_item, stream_rank, saved_by_url)
                 yield_payload = {
@@ -227,7 +317,8 @@ def search_oer_stream():
                         }))
                         return
 
-                    final_payload = _normalize_search_results(results, course_code, term)
+                    final_payload = _normalize_search_results(results, course_code, term, user_id=uid_save_stream)
+                    _log_search_impressions(get_supabase_client(), final_payload, user_id=request_user_id)
                     output_queue.put(event_line({'type': 'complete', **final_payload}))
                 except Exception as e:
                     logger.error(f"Error in stream search endpoint: {e}", exc_info=True)
@@ -411,7 +502,14 @@ def scrape_syllabi_for_course():
         return jsonify({'error': str(e)}), 500
 
 
+@app.route('/api/auth/me', methods=['GET'])
+def auth_me():
+    """Return current JWT user or null."""
+    return jsonify({'user': getattr(g, 'user', None)}), 200
+
+
 @app.route('/api/saved-resources', methods=['GET'])
+@login_required
 def list_saved_resources():
     """List saved resources for all courses or one course code."""
     course_code = request.args.get('course_code', '').strip().upper()
@@ -422,11 +520,15 @@ def list_saved_resources():
     if not sb.is_available():
         return jsonify({'error': 'Supabase is not configured or unavailable'}), 500
 
-    rows = sb.list_saved_resources(course_code or None)
+    uid = _effective_user_id()
+    if not uid:
+        return jsonify({'error': 'Authentication required'}), 401
+    rows = sb.list_saved_resources(course_code or None, user_id=uid)
     return jsonify({'saved_resources': rows}), 200
 
 
 @app.route('/api/saved-resources', methods=['POST'])
+@login_required
 def save_resource():
     """Save (or update) a resource snapshot."""
     data = request.get_json() or {}
@@ -443,7 +545,12 @@ def save_resource():
     if not sb.is_available():
         return jsonify({'error': 'Supabase is not configured or unavailable'}), 500
 
+    uid = _effective_user_id()
+    if not uid:
+        return jsonify({'error': 'Authentication required'}), 401
+
     row = {
+        'user_id': uid,
         'course_code': course_code,
         'resource_url': str(data.get('resource_url', '')).strip(),
         'title': str(data.get('title', '')).strip(),
@@ -461,21 +568,138 @@ def save_resource():
 
 
 @app.route('/api/saved-resources/<resource_id>', methods=['DELETE'])
+@login_required
 def delete_saved_resource(resource_id):
     """Delete saved resource by id."""
     sb = get_supabase_client()
     if not sb.is_available():
         return jsonify({'error': 'Supabase is not configured or unavailable'}), 500
-    deleted = sb.delete_saved_resource(resource_id)
+    uid = _effective_user_id()
+    if not uid:
+        return jsonify({'error': 'Authentication required'}), 401
+    deleted = sb.delete_saved_resource(resource_id, user_id=uid)
     if not deleted:
         return jsonify({'error': 'Saved resource not found'}), 404
     return jsonify({'deleted': True, 'id': resource_id}), 200
+
+
+@app.route('/api/feedback/event', methods=['POST'])
+def log_feedback_event():
+    """Log a user feedback event used by adaptive ranking and query policy."""
+    data = request.get_json() or {}
+    event_type = str(data.get('event_type', '')).strip()
+    if not event_type:
+        return jsonify({'error': 'Missing event_type'}), 400
+
+    sb = get_supabase_client()
+    if not sb.is_available():
+        return jsonify({'error': 'Supabase is not configured or unavailable'}), 500
+
+    row = {
+        'search_session_id': data.get('search_session_id'),
+        'user_id': current_user_id(),
+        'result_id': data.get('result_id'),
+        'event_type': event_type,
+        'course_code': str(data.get('course_code', '')).strip().upper() or None,
+        'resource_url': data.get('resource_url'),
+        'criterion': data.get('criterion'),
+        'old_score': data.get('old_score'),
+        'new_score': data.get('new_score'),
+        'reason': data.get('reason'),
+        'metadata': data.get('metadata') or {},
+    }
+    saved = sb.insert_feedback_event(row)
+    if not saved:
+        return jsonify({'error': 'Unable to persist feedback event'}), 500
+    return jsonify(saved), 201
+
+
+@app.route('/api/feedback/dispute', methods=['POST'])
+def dispute_rating():
+    """Submit a criterion-level dispute/manual override for a resource rating."""
+    data = request.get_json() or {}
+    required = ['course_code', 'resource_url', 'criterion']
+    missing = [field for field in required if not str(data.get(field, '')).strip()]
+    if missing:
+        return jsonify({'error': f"Missing required fields: {', '.join(missing)}"}), 400
+
+    if not Config.ENABLE_RATING_DISPUTES:
+        return jsonify({'error': 'Rating disputes are disabled'}), 403
+
+    sb = get_supabase_client()
+    if not sb.is_available():
+        return jsonify({'error': 'Supabase is not configured or unavailable'}), 500
+
+    row = {
+        'search_session_id': data.get('search_session_id'),
+        'user_id': current_user_id(),
+        'result_id': data.get('result_id'),
+        'event_type': 'dispute',
+        'course_code': str(data.get('course_code', '')).strip().upper(),
+        'resource_url': data.get('resource_url'),
+        'criterion': data.get('criterion'),
+        'old_score': data.get('old_score'),
+        'new_score': data.get('new_score'),
+        'reason': data.get('reason') or '',
+        'metadata': {
+            'manual_override': bool(data.get('manual_override', True)),
+            'dispute': True,
+        },
+    }
+    saved = sb.insert_feedback_event(row)
+    if not saved:
+        return jsonify({'error': 'Unable to persist dispute'}), 500
+    return jsonify(saved), 201
 
 @app.route('/api/courses', methods=['GET'])
 def get_required_courses():
     """Get list of required courses for testing"""
     config = Config()
     return jsonify({'courses': config.REQUIRED_COURSES})
+
+
+@app.route('/api/learning/mine-terms', methods=['POST'])
+def mine_terms():
+    """Recompute query_term_stats from global feedback + impressions."""
+    sb = get_supabase_client()
+    if not sb.is_available():
+        return jsonify({'error': 'Supabase is not configured or unavailable'}), 500
+    try:
+        joined = sb.fetch_training_rows(limit=5000)
+        stats_rows = mine_term_stats_from_training_rows(joined)
+        n = sb.upsert_term_stats(stats_rows)
+        return jsonify({'updated': n, 'term_rows': len(stats_rows)}), 200
+    except Exception as exc:
+        logger.error("Term mining failed: %s", exc, exc_info=True)
+        return jsonify({'error': str(exc)}), 500
+
+
+@app.route('/api/learning/term-policy', methods=['GET'])
+def get_term_policy():
+    """Inspect mined term weights for a subject prefix (e.g. ENGL)."""
+    subject = request.args.get('subject', '').strip().upper()
+    if not subject:
+        return jsonify({'error': 'subject query parameter is required'}), 400
+    sb = get_supabase_client()
+    if not sb.is_available():
+        return jsonify({'error': 'Supabase is not configured or unavailable'}), 500
+    rows = sb.fetch_term_policy(subject)
+    return jsonify({'subject': subject, 'terms': rows}), 200
+
+
+@app.route('/api/learning/train-reranker', methods=['POST'])
+def train_reranker():
+    """Trigger local reranker training from accumulated feedback."""
+    if not Config.ENABLE_RERANKER:
+        return jsonify({'error': 'Reranker is disabled'}), 403
+    try:
+        result = train_and_save()
+        if not result.get('trained'):
+            return jsonify(result), 202
+        return jsonify(result), 200
+    except Exception as exc:
+        logger.error("Reranker training failed: %s", exc, exc_info=True)
+        return jsonify({'error': str(exc)}), 500
 
 def _warn_on_python_version() -> None:
     """Print a compatibility warning for Python runtimes newer than tested range."""

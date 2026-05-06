@@ -8,6 +8,8 @@ from typing import Callable, Dict, List, Optional
 import logging
 from urllib.parse import quote_plus, urlparse
 from datetime import datetime, timezone
+from uuid import uuid4
+import random
 
 import requests
 
@@ -26,6 +28,8 @@ from .evaluators.rubric_evaluator import RubricEvaluator
 from .evaluators.license_checker import LicenseChecker
 from .utils.logger import UsageLogger
 from .llm.supabase_client import get_supabase_client
+from .learning.reranker import Reranker
+from .learning.term_miner import TermPolicy
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -116,6 +120,8 @@ class OERAgent:
         self.logger = UsageLogger(self.config.LOG_DIR)
         self.relevance_weight = max(0.0, float(self.config.RELEVANCE_WEIGHT))
         self.rubric_weight = max(0.0, float(self.config.RUBRIC_WEIGHT))
+        self.reranker_weight = max(0.0, float(getattr(self.config, 'RERANKER_WEIGHT', 0.35)))
+        self.reranker = Reranker()
 
     def _safe_scraper_search(self, scraper, scraper_name: str, query: str, course_code: str) -> List[Dict]:
         """Execute scraper search with defensive logging and stable fallback."""
@@ -607,7 +613,7 @@ class OERAgent:
             profile.update({
                 'canonical_title': 'Introduction to Information Technology',
                 'preferred_queries': [
-                    'introduction to computing',
+                    'introduction to computing computer systems',
                     'introduction to information technology',
                     'information technology fundamentals',
                     'computer information systems fundamentals',
@@ -833,6 +839,27 @@ class OERAgent:
         max_terms = max(1, int(self.config.MAX_QUERY_TERMS_PER_VARIANT))
         return ' '.join(terms[:max_terms])
 
+    def _course_subject(self, course_code: str) -> str:
+        parts = (course_code or '').strip().upper().split()
+        return parts[0] if parts else ''
+
+    def _load_term_policy(self, course_code: str) -> TermPolicy:
+        suppress = float(getattr(self.config, 'TERM_POLICY_SUPPRESS_THRESHOLD', -2.0))
+        if not getattr(self.config, 'ENABLE_TERM_POLICY', True):
+            return TermPolicy.empty(suppress_threshold=suppress)
+        if not self.supabase_client.is_available():
+            return TermPolicy.empty(suppress_threshold=suppress)
+        subject = self._course_subject(course_code)
+        rows = self.supabase_client.fetch_term_policy(subject)
+        return TermPolicy(rows, suppress_threshold=suppress)
+
+    def _variant_rate_for_query(self, query: str) -> float:
+        cache = getattr(self, '_variant_feedback_maps', None)
+        if not cache:
+            return 0.0
+        score_by_query, seen_by_query = cache
+        return score_by_query.get(query, 0.0) / max(1, seen_by_query.get(query, 0))
+
     def _build_syllabus_queries(self, course_code: str, syllabus_context: Dict) -> List[str]:
         """Create syllabus-driven query variants; keep course code as low-priority fallback."""
         title = syllabus_context.get('course_title', '')
@@ -863,6 +890,15 @@ class OERAgent:
         # Keep raw course code only as a backstop query variant.
         variants.append(self._truncate_query_terms(course_code))
 
+        tp = getattr(self, '_current_term_policy', None)
+        if tp and getattr(self.config, 'ENABLE_TERM_POLICY', True):
+            k = max(0, int(getattr(self.config, 'TERM_POLICY_TOP_K', 8)))
+            boosts = tp.boost_terms_top_k(k)
+            subj = self._course_subject(course_code)
+            for term in boosts:
+                variants.append(self._truncate_query_terms(f'{subj} {term} open educational resources'))
+                variants.append(self._truncate_query_terms(f'{term} OER'))
+
         max_variants = max(1, int(self.config.MAX_SYLLABUS_QUERY_VARIANTS))
         deduped = [item for item in dict.fromkeys([v for v in variants if v.strip()])]
 
@@ -876,6 +912,9 @@ class OERAgent:
                         anchored.append(variant)
                 if anchored:
                     deduped = anchored
+
+        if tp and getattr(self.config, 'ENABLE_TERM_POLICY', True):
+            deduped = [v for v in deduped if not tp.should_drop(v)]
 
         return deduped[:max_variants]
 
@@ -1032,15 +1071,17 @@ class OERAgent:
         if not text.strip():
             return False
 
+        required_terms = [term for term in profile.get('required_terms', []) if term]
+        excluded_terms = [term for term in profile.get('excluded_terms', []) if term]
+        # Keep strict guardrails: excluded-domain matches always lose.
+        if any(term in text for term in excluded_terms):
+            return False
+
         for phrase in profile.get('preferred_queries', []):
             phrase_lower = phrase.lower().strip()
             if phrase_lower and phrase_lower in text:
                 return True
 
-        required_terms = [term for term in profile.get('required_terms', []) if term]
-        excluded_terms = [term for term in profile.get('excluded_terms', []) if term]
-        if any(term in text for term in excluded_terms):
-            return False
         matched_terms = [term for term in required_terms if term in text]
         return len(set(matched_terms)) >= 2
 
@@ -1104,6 +1145,106 @@ class OERAgent:
         if total <= 0:
             return float(rubric_score)
         return (float(relevance_score) * self.relevance_weight + float(rubric_score) * self.rubric_weight) / total
+
+    def _blend_with_reranker(self, base_score: float, reranker_score: float) -> float:
+        """Blend deterministic score with learned score when enabled."""
+        if not getattr(self.config, 'ENABLE_RERANKER', True):
+            return base_score
+        if reranker_score <= 0:
+            return base_score
+        return ((1 - self.reranker_weight) * base_score) + (self.reranker_weight * reranker_score * 5.0)
+
+    def _build_feature_payload(
+        self,
+        resource: Dict,
+        rank_position: int,
+        relevance_score: float,
+        rubric_score: float,
+        criteria_scores: Dict,
+        query_variant: str = '',
+        term_policy_score: float = 0.0,
+        query_variant_positive_rate: float = 0.0,
+    ) -> Dict:
+        """Build stable feature vector for reranker training and inference."""
+        criteria_vals = [float(v or 0) for v in (criteria_scores or {}).values()]
+        return {
+            'final_rank_score': self._compute_final_rank_score(relevance_score, rubric_score),
+            'syllabus_relevance_score': relevance_score,
+            'rubric_score': rubric_score,
+            'rank_position_inv': 1.0 / rank_position if rank_position > 0 else 0.0,
+            'is_primary_source': 1.0 if self._is_primary_source(resource) else 0.0,
+            'source_tier': 'primary' if self._is_primary_source(resource) else 'fallback',
+            'criteria_scores': criteria_scores or {},
+            'criteria_mean': (sum(criteria_vals) / len(criteria_vals)) if criteria_vals else 0.0,
+            'criteria_min': min(criteria_vals) if criteria_vals else 0.0,
+            'query_variant': query_variant,
+            'term_policy_score': float(term_policy_score or 0),
+            'query_variant_positive_rate': float(query_variant_positive_rate or 0),
+        }
+
+    def _apply_adaptive_query_policy(self, course_code: str, query_variants: List[str]) -> List[str]:
+        """Reorder query variants using historical performance + mined term policy + epsilon exploration."""
+        term_policy = getattr(self, '_current_term_policy', None)
+        blend_w = float(getattr(self.config, 'TERM_POLICY_BLEND_WEIGHT', 0.5))
+
+        score_by_query = {query: 0.0 for query in query_variants}
+        seen_by_query = {query: 0 for query in query_variants}
+        self._variant_feedback_maps = (score_by_query, seen_by_query)
+
+        if not getattr(self.config, 'ENABLE_ADAPTIVE_QUERY_POLICY', True):
+            return query_variants
+        if len(query_variants) <= 1:
+            return query_variants
+        if not self.supabase_client.is_available():
+            return query_variants
+
+        stats_rows = self.supabase_client.fetch_query_policy_stats(
+            course_code=course_code,
+            limit=int(getattr(self.config, 'ADAPTIVE_QUERY_HISTORY_LIMIT', 200)),
+        )
+        if not stats_rows:
+            ranked = list(query_variants)
+            epsilon = float(getattr(self.config, 'ADAPTIVE_QUERY_EPSILON', 0.15))
+            if random.random() < epsilon:
+                random.shuffle(ranked)
+            return ranked
+
+        for row in stats_rows:
+            feature_payload = (row.get('impression', {}) or {}).get('feature_payload', {}) or {}
+            qv_key = feature_payload.get('query_variant')
+            if qv_key not in score_by_query:
+                continue
+            feedback = row.get('feedback', []) or []
+            event_types = {item.get('event_type') for item in feedback}
+            reward = 0.0
+            if 'save' in event_types or 'thumbs_up' in event_types or 'manual_override' in event_types:
+                reward += 1.0
+            if 'dispute' in event_types or 'thumbs_down' in event_types:
+                reward -= 0.75
+            if 'open_detail' in event_types or 'click' in event_types:
+                reward += 0.1
+            score_by_query[qv_key] += reward
+            seen_by_query[qv_key] += 1
+
+        self._variant_feedback_maps = (score_by_query, seen_by_query)
+
+        def combined_score(query: str) -> float:
+            raw = score_by_query.get(query, 0.0)
+            norm_hist = raw / max(1, seen_by_query.get(query, 0))
+            if term_policy and getattr(self.config, 'ENABLE_TERM_POLICY', True):
+                term_part = term_policy.normalized_score(query)
+                return (1.0 - blend_w) * norm_hist + blend_w * term_part
+            return norm_hist
+
+        ranked = sorted(
+            query_variants,
+            key=lambda q: (combined_score(q), seen_by_query.get(q, 0)),
+            reverse=True,
+        )
+        epsilon = float(getattr(self.config, 'ADAPTIVE_QUERY_EPSILON', 0.15))
+        if random.random() < epsilon:
+            random.shuffle(ranked)
+        return ranked
 
     def _candidate_prefilter_score(self, resource: Dict, syllabus_context: Dict, course_code: str) -> int:
         """Cheap pre-evaluation ranking signal based on syllabus term overlap."""
@@ -1227,8 +1368,11 @@ class OERAgent:
             # Step 2: Build syllabus-driven query variants and search primary libraries first.
             logger.info("Step 2: Building syllabus-driven queries and searching primary sources...")
             syllabus_context = self._syllabus_context_from_info(course_code, syllabus_info)
+            self._current_term_policy = self._load_term_policy(course_code)
             query_variants = self._build_syllabus_queries(course_code, syllabus_context)
+            query_variants = self._apply_adaptive_query_policy(course_code, query_variants)
             logger.info("Syllabus query variants for %s: %s", course_code, query_variants)
+            search_session_id = str(uuid4())
 
             primary_start = time.time()
             primary_resources = self._search_primary_sources(query_variants, course_code, syllabus_context)
@@ -1377,12 +1521,7 @@ class OERAgent:
                         rubric_eval = self.rubric_evaluator.evaluate(resource, llm_eval)
                     except Exception as e:
                         logger.error(f"Rubric evaluation failed: {e}")
-                        # Create minimal evaluation
-                        rubric_eval = {
-                            'criteria_evaluations': {},
-                            'overall_score': 0,
-                            'summary': 'Evaluation incomplete'
-                        }
+                        rubric_eval = self.rubric_evaluator.empty_evaluation('Evaluation incomplete')
 
                     criterion_links = self._build_criterion_links(resource, rubric_eval)
                     
@@ -1402,11 +1541,34 @@ class OERAgent:
                     # Combine evaluations
                     rubric_score = float(rubric_eval.get('overall_score', 0) or 0)
                     relevance_score = float(relevance_eval.get('score', 3.0) or 3.0)
-                    final_rank_score = self._compute_final_rank_score(relevance_score, rubric_score)
+                    criteria_scores = {
+                        criterion: payload.get('score', 0)
+                        for criterion, payload in (rubric_eval.get('criteria_evaluations', {}) or {}).items()
+                        if isinstance(payload, dict)
+                    }
+                    qv = resource.get('query', '') or ''
+                    tp = getattr(self, '_current_term_policy', None)
+                    term_policy_score = tp.score(qv) if tp else 0.0
+                    qv_rate = self._variant_rate_for_query(qv)
+                    feature_payload = self._build_feature_payload(
+                        resource,
+                        idx + 1,
+                        relevance_score,
+                        rubric_score,
+                        criteria_scores,
+                        query_variant=qv,
+                        term_policy_score=term_policy_score,
+                        query_variant_positive_rate=qv_rate,
+                    )
+                    base_rank_score = feature_payload.get('final_rank_score', 0)
+                    reranker_score = self.reranker.score(feature_payload) if self.reranker.is_ready() else 0.0
+                    final_rank_score = self._blend_with_reranker(base_rank_score, reranker_score)
                     source_tier = 'primary' if self._is_primary_source(resource) else 'fallback'
 
                     evaluated_resource = {
                         'resource': resource,
+                        'search_session_id': search_session_id,
+                        'result_id': str(uuid4()),
                         'relevance_explanation': identified.get('relevance_explanation', ''),
                         'syllabus_relevance': relevance_eval,
                         'syllabus_relevance_score': relevance_score,
@@ -1414,6 +1576,8 @@ class OERAgent:
                         'rubric_evaluation': rubric_eval,
                         'rubric_score': rubric_score,
                         'final_rank_score': final_rank_score,
+                        'reranker_score': reranker_score,
+                        'feature_payload': feature_payload,
                         'source_tier': source_tier,
                         'matched_topics': relevance_eval.get('matched_topics', []),
                         'license_check': license_check,
@@ -1439,6 +1603,8 @@ class OERAgent:
                         if resource:
                             minimal_resource = {
                                 'resource': resource,
+                                'search_session_id': search_session_id,
+                                'result_id': str(uuid4()),
                                 'relevance_explanation': identified.get('relevance_explanation', f'Resource for {course_code}'),
                                 'syllabus_relevance': {
                                     'score': 1.0,
@@ -1448,13 +1614,22 @@ class OERAgent:
                                 'syllabus_relevance_score': 1.0,
                                 'llm_evaluation': {},
                                 'rubric_evaluation': {
+                                    **self.rubric_evaluator.empty_evaluation(
+                                        'Evaluation failed - resource added with minimal data'
+                                    ),
                                     'resource': resource,
-                                    'criteria_evaluations': {},
-                                    'overall_score': 0,
-                                    'summary': 'Evaluation failed - resource added with minimal data'
                                 },
                                 'rubric_score': 0.0,
                                 'final_rank_score': 0.0,
+                                'reranker_score': 0.0,
+                                'feature_payload': self._build_feature_payload(
+                                    resource,
+                                    idx + 1,
+                                    1.0,
+                                    0.0,
+                                    {},
+                                    query_variant=resource.get('query', '') or '',
+                                ),
                                 'source_tier': 'primary' if self._is_primary_source(resource) else 'fallback',
                                 'matched_topics': [],
                                 'license_check': {
@@ -1509,6 +1684,7 @@ class OERAgent:
                 'resources_found': len(all_resources) if all_resources else len(evaluated_resources),
                 'resources_evaluated': len(evaluated_resources),
                 'query_variants': query_variants,
+                'search_session_id': search_session_id,
                 'evaluated_resources': evaluated_resources,
                 'summary': self._generate_summary(evaluated_resources),
                 'processing_time_seconds': processing_time

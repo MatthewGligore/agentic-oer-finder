@@ -1,0 +1,20 @@
+[Unit]
+Description=Agentic OER Finder Flask API (gunicorn)
+After=network.target
+
+[Service]
+Type=simple
+User=pi
+Group=pi
+WorkingDirectory=/home/pi/agentic-oer-finder
+Environment=PATH=/home/pi/agentic-oer-finder/.venv/bin
+ExecStart=/home/pi/agentic-oer-finder/.venv/bin/gunicorn \
+  --workers 2 \
+  --bind 127.0.0.1:8000 \
+  --timeout 120 \
+  backend.app:app
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
