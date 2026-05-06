@@ -1,14 +1,52 @@
+# Environment (keep *.example tracked)
 .env
 .env.local
+.env.*.local
+
+# Python
 __pycache__/
 *.py[cod]
-venv/
+*$py.class
 .venv/
-frontend/node_modules/
-frontend/dist/
+venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+coverage.xml
+htmlcov/
+*.egg-info/
+.eggs/
+
+# Packaging / build output at repo root (if added)
+/build/
+/dist/
+
+# Reranker training writes pickle + metadata here
+backend/learning/model_artifacts/
+
+# Logs
 logs/
 *.log
+
+# Frontend (Node / Vite / Netlify CLI)
+node_modules/
+frontend/node_modules/
+frontend/dist/
+.netlify/
+
+# IDE / editor
 .vscode/
 .idea/
+*.swp
+*.swo
+*~
+
+# OS
 .DS_Store
 Thumbs.db
+
+# Cursor — ignore local agent state; un-ignore rules you want in the repo
+.cursor/*
+!.cursor/rules/
+!.cursor/rules/**
