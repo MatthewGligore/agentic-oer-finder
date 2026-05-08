@@ -27,7 +27,7 @@ function TopNav() {
           <span className="material-symbols-outlined">{menuOpen ? 'close' : 'menu'}</span>
         </button>
         <span className="brand-wordmark">ScholarFlow Console</span>
-        <nav className="top-links">
+        <nav className="top-links desktop-only">
           {navItems.map((item) => (
             <NavLink key={item.to} to={item.to} className={({ isActive }) => `top-link ${isActive ? 'active' : ''}`}>
               {item.label}
@@ -83,16 +83,6 @@ function TopNav() {
             {item.label}
           </NavLink>
         ))}
-        {!user && supabaseConfigured ? (
-          <>
-            <NavLink to="/login" className={({ isActive }) => `top-link ${isActive ? 'active' : ''}`} onClick={() => setMenuOpen(false)}>
-              Sign in
-            </NavLink>
-            <NavLink to="/register" className={({ isActive }) => `top-link ${isActive ? 'active' : ''}`} onClick={() => setMenuOpen(false)}>
-              Register
-            </NavLink>
-          </>
-        ) : null}
       </nav>
     </header>
   )

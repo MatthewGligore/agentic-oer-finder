@@ -29,16 +29,12 @@ export function AppStateProvider({ children }) {
   const [analysisProgress, setAnalysisProgress] = useState(18)
   const [analysisStage, setAnalysisStage] = useState('Ready')
   const [analysisDetail, setAnalysisDetail] = useState('Waiting for search.')
-  const [isDarkMode, setIsDarkMode] = useState(true)
+  const [isDarkMode, setIsDarkMode] = useState(false)
   const [searchStartedAt, setSearchStartedAt] = useState(null)
 
   useEffect(() => {
     const storedTheme = localStorage.getItem('theme')
-    if (storedTheme === 'light') {
-      setIsDarkMode(false)
-      return
-    }
-    setIsDarkMode(true)
+    setIsDarkMode(storedTheme === 'dark')
   }, [])
 
   useEffect(() => {
